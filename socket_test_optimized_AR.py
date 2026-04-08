@@ -38,22 +38,13 @@ class Args:
     model_path: str = "./checkpoints/dreamzero"
     enable_dit_cache: bool = False
     index: int = 0
+    embodiment_tag: str = "oxe_droid"
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
 
 
-class ARDroidRoboarenaPolicy:
-    """Wrapper policy that implements roboarena.policy.BasePolicy interface for AR_droid.
-    
-    Handles:
-    - Observation format conversion (roboarena -> AR_droid format)
-    - Frame accumulation across calls (roboarena sends single frames, AR_droid expects multi-frame video)
-    - Action format conversion (AR_droid dict -> roboarena array format)
-    - Distributed inference coordination
-    """
-    
-    # Number of frames to accumulate after the first call
-    FRAMES_PER_CHUNK = 4
-    
+class DistributedRoboarenaPolicyBase:
+    """Shared distributed inference plumbing for websocket policy wrappers."""
+
     def __init__(
         self,
         groot_policy: GrootSimPolicy,
@@ -63,254 +54,83 @@ class ARDroidRoboarenaPolicy:
         self._policy = groot_policy
         self._signal_group = signal_group
         self._output_dir = output_dir
-        
-        # Frame buffers for accumulation (per camera view)
-        self._frame_buffers: dict[str, list[np.ndarray]] = {
-            "video.exterior_image_1_left": [],
-            "video.exterior_image_2_left": [],
-            "video.wrist_image_left": [],
-        }
-        self._call_count = 0
-        self._is_first_call = True
-        
-        # Session tracking - reset state when new session starts
+        self._frame_buffers = self._init_frame_buffers()
         self._current_session_id: str | None = None
-        
-        # Video across time for saving (similar to original server)
         self.video_across_time = []
         self._msg_index = 0
-        
-        # Create output directory if specified
+
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
-    
-    def _convert_observation(self, obs: dict) -> dict:
-        """Convert roboarena observation format to AR_droid format.
-        
-        Roboarena format:
-            - observation/exterior_image_0_left: (H, W, 3) single frame
-            - observation/exterior_image_1_left: (H, W, 3) single frame
-            - observation/wrist_image_left: (H, W, 3) single frame
-            - observation/joint_position: (7,)
-            - observation/gripper_position: (1,)
-            - prompt: str
-        
-        AR_droid format:
-            - video.exterior_image_1_left: (T, H, W, 3) multi-frame
-            - video.exterior_image_2_left: (T, H, W, 3) multi-frame
-            - video.wrist_image_left: (T, H, W, 3) multi-frame
-            - state.joint_position: (1, 7)
-            - state.gripper_position: (1, 1)
-            - annotation.language.action_text: str
-        """
-        converted = {}
-        
-        # Map image keys (roboarena uses 0-indexed, AR_droid uses 1-indexed)
-        image_key_mapping = {
-            "observation/exterior_image_0_left": "video.exterior_image_1_left",
-            "observation/exterior_image_1_left": "video.exterior_image_2_left",
-            "observation/wrist_image_left": "video.wrist_image_left",
-        }
-        
-        # Accumulate frames for each camera view
-        for roboarena_key, droid_key in image_key_mapping.items():
-            if roboarena_key in obs:
-                data = obs[roboarena_key]
-                if isinstance(data, np.ndarray):
-                    if data.ndim == 4:
-                        # Multiple frames (T, H, W, 3)
-                        self._frame_buffers[droid_key].extend(list(data))
-                    else:
-                        # Single frame (H, W, 3)
-                        self._frame_buffers[droid_key].append(data)
 
-        # Determine how many frames to use
-        if self._is_first_call:
-            # First call: use only 1 frame
-            num_frames = 1
-        else:
-            # Subsequent calls: use exactly FRAMES_PER_CHUNK frames
-            num_frames = self.FRAMES_PER_CHUNK
-        
-        # Build video tensors from accumulated frames
-        for droid_key, buffer in self._frame_buffers.items():
-            if len(buffer) > 0:
-                if len(buffer) >= num_frames:
-                    # Take the last num_frames frames
-                    frames_to_use = buffer[-num_frames:]
-                else:
-                    # Pad by repeating the first frame to reach num_frames
-                    frames_to_use = buffer.copy()
-                    while len(frames_to_use) < num_frames:
-                        # Prepend the first frame to pad
-                        frames_to_use.insert(0, buffer[0])
-                # Stack to (T, H, W, C)
-                video = np.stack(frames_to_use, axis=0)
-                converted[droid_key] = video
-        
-        # Convert state observations
-        if "observation/joint_position" in obs:
-            joint_pos = obs["observation/joint_position"]
-            # Reshape to (1, 7) if needed
-            if joint_pos.ndim == 1:
-                joint_pos = joint_pos.reshape(1, -1)
-            converted["state.joint_position"] = joint_pos.astype(np.float64)
-        else:
-            converted["state.joint_position"] = np.zeros((1, 7), dtype=np.float64)
-        
-        if "observation/gripper_position" in obs:
-            gripper_pos = obs["observation/gripper_position"]
-            # Reshape to (1, 1) if needed
-            if gripper_pos.ndim == 1:
-                gripper_pos = gripper_pos.reshape(1, -1)
-            converted["state.gripper_position"] = gripper_pos.astype(np.float64)
-        else:
-            converted["state.gripper_position"] = np.zeros((1, 1), dtype=np.float64)
-        
-        # Convert prompt
-        if "prompt" in obs:
-            converted["annotation.language.action_text"] = obs["prompt"]
-        else:
-            converted["annotation.language.action_text"] = ""
-        
-        return converted
-    
+    def _init_frame_buffers(self) -> dict[str, list[np.ndarray]]:
+        return {}
+
+    def _reset_custom_state(self) -> None:
+        pass
+
+    def _after_infer(self) -> None:
+        pass
+
+    def _prepare_video_chunk(self, video_pred: torch.Tensor) -> torch.Tensor:
+        return video_pred
+
+    def _video_save_fps(self) -> int:
+        return 5
+
+    def _convert_observation(self, obs: dict) -> dict:
+        raise NotImplementedError
+
     def _convert_action(self, action_dict: dict) -> np.ndarray:
-        """Convert AR_droid action dict to roboarena action array.
-        
-        AR_droid format:
-            - action.joint_position: (N, 7)
-            - action.gripper_position: (N,) or (N, 1)
-        
-        Roboarena format:
-            - action: (N, 8) - 7 joint positions + 1 gripper
-        """
-        joint_action = None
-        gripper_action = None
-        
-        # Extract actions from dict
-        for key, value in action_dict.items():
-            if "joint_position" in key:
-                joint_action = value
-            elif "gripper_position" in key or "gripper" in key:
-                gripper_action = value
-        
-        if joint_action is None:
-            # Fallback: return zeros
-            return np.zeros((1, 8), dtype=np.float32)
-        
-        # Convert to numpy if tensor
-        if isinstance(joint_action, torch.Tensor):
-            joint_action = joint_action.cpu().numpy()
-        
-        # Ensure 2D shape (N, 7)
-        if joint_action.ndim == 1:
-            joint_action = joint_action.reshape(1, -1)
-        
-        N = joint_action.shape[0]
-        
-        # Handle gripper action
-        if gripper_action is not None:
-            if isinstance(gripper_action, torch.Tensor):
-                gripper_action = gripper_action.cpu().numpy()
-            # Reshape to (N, 1) if needed
-            if gripper_action.ndim == 1:
-                gripper_action = gripper_action.reshape(-1, 1)
-            elif gripper_action.ndim == 0:
-                gripper_action = gripper_action.reshape(1, 1)
-        else:
-            gripper_action = np.zeros((N, 1), dtype=np.float32)
-        
-        # Concatenate: (N, 7) + (N, 1) -> (N, 8)
-        action = np.concatenate([joint_action, gripper_action], axis=-1).astype(np.float32)
-        
-        return action
-    
+        raise NotImplementedError
+
     def _broadcast_batch_to_workers(self, obs: dict) -> None:
-        """Broadcast batch data from rank 0 to all other ranks."""
         import pickle
-        
-        # Serialize the obs
+
         serialized = pickle.dumps(obs)
         data_size = len(serialized)
-        
-        # Broadcast size first
+
         size_tensor = torch.tensor([data_size], dtype=torch.int64, device='cuda')
         dist.broadcast(size_tensor, src=0)
-        
-        # Broadcast data
+
         data_tensor = torch.frombuffer(serialized, dtype=torch.uint8).cuda()
         dist.broadcast(data_tensor, src=0)
-    
+
+    def _extract_action_dict(self, action_chunk_dict: object) -> dict[str, object]:
+        action_dict: dict[str, object] = {}
+        for key in dir(action_chunk_dict):
+            if key.startswith('action.'):
+                action_dict[key] = getattr(action_chunk_dict, key)
+        return action_dict
+
     def infer(self, obs: dict) -> np.ndarray:
-        """Infer actions from observations.
-        
-        Args:
-            obs: Observation dict in roboarena format
-            
-        Returns:
-            action: (N, 8) action array
-        """
-        # Check for session change - reset state if new session
-        session_id = obs.get("session_id", None)
+        session_id = obs.get('session_id')
         if session_id is not None and session_id != self._current_session_id:
             if self._current_session_id is not None:
-                logger.info(f"Session changed from '{self._current_session_id}' to '{session_id}', resetting state")
-                # Reset state for new session
+                logger.info("Session changed from '%s' to '%s', resetting state", self._current_session_id, session_id)
                 self._reset_state()
             else:
-                logger.info(f"New session started: '{session_id}'")
+                logger.info("New session started: '%s'", session_id)
             self._current_session_id = session_id
-        
+
         self._msg_index += 1
-        self._call_count += 1
-        
-        # Convert observation format
         converted_obs = self._convert_observation(obs)
-        
-        # Signal workers to continue (0 = continue)
+
         signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
         dist.broadcast(signal_tensor, src=0, group=self._signal_group)
-        
-        # Broadcast obs to workers
         self._broadcast_batch_to_workers(converted_obs)
-        
-        # Create batch for policy
+
         batch = Batch(obs=converted_obs)
-        
-        # Distributed forward pass
         dist.barrier()
         with torch.no_grad():
             result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
         dist.barrier()
-        
-        # Store video predictions for potential saving
-        self.video_across_time.append(video_pred)
-        
-        # Extract and convert action
-        action_chunk_dict = result_batch.act
-        
-        # Convert Batch to dict
-        action_dict = {}
-        for k in dir(action_chunk_dict):
-            if k.startswith("action."):
-                action_dict[k] = getattr(action_chunk_dict, k)
-        
-        action = self._convert_action(action_dict)
-        
-        # Update first call flag
-        if self._is_first_call:
-            self._is_first_call = False
-        
+
+        self.video_across_time.append(self._prepare_video_chunk(video_pred))
+        action = self._convert_action(self._extract_action_dict(result_batch.act))
+        self._after_infer()
         return action
-    
+
     def _reset_state(self, save_video: bool = True) -> None:
-        """Internal method to reset policy state.
-        
-        Args:
-            save_video: Whether to save accumulated video before reset.
-        """
-        # Optionally save accumulated video before reset
         if save_video and len(self.video_across_time) > 0 and self._output_dir:
             try:
                 frame_list = []
@@ -321,41 +141,253 @@ class ARDroidRoboarenaPolicy:
                     tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
                     tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
                 )
-                frames = rearrange(frames, "B C T H W -> B T H W C")
+                frames = rearrange(frames, 'B C T H W -> B T H W C')
                 frames = frames[0]
                 frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
                 for frame in frames:
                     frame_list.append(frame)
-                
-                if len(frame_list) > 0:
+
+                if frame_list:
                     sample_frame = frame_list[0]
                     if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
                         save_dir = self._output_dir
                         os.makedirs(save_dir, exist_ok=True)
-                        all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
-                        timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
+                        all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith('.mp4')]
+                        timestamp = datetime.datetime.now().strftime('%m_%d_%H_%M_%S')
                         num_frames = len(frame_list)
-                        n = (num_frames - 1) // 8
-                        output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_n{n}.mp4')
-                        imageio.mimsave(output_path, frame_list, fps=5, codec='libx264')
-                        logger.info(f"Saved video on reset to: {output_path}")
-            except Exception as e:
-                logger.warning(f"Failed to save video on reset: {e}")
-        
-        # Clear frame buffers
+                        output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_f{num_frames}.mp4')
+                        imageio.mimsave(output_path, frame_list, fps=self._video_save_fps(), codec='libx264')
+                        logger.info('Saved video on reset to: %s', output_path)
+            except Exception as exc:
+                logger.warning('Failed to save video on reset: %s', exc)
+
         for key in self._frame_buffers:
             self._frame_buffers[key] = []
-        
-        self._call_count = 0
-        self._is_first_call = True
+
         self.video_across_time = []
-    
+        self._reset_custom_state()
+
     def reset(self, reset_info: dict) -> None:
-        """Reset the policy state for a new episode.
-        
-        Clears frame buffers and resets call count.
-        """
         self._reset_state(save_video=True)
+
+
+class ARDroidRoboarenaPolicy(DistributedRoboarenaPolicyBase):
+    """Wrapper policy that implements roboarena.policy.BasePolicy interface for AR_droid."""
+
+    FRAMES_PER_CHUNK = 4
+
+    def __init__(
+        self,
+        groot_policy: GrootSimPolicy,
+        signal_group: dist.ProcessGroup,
+        output_dir: str | None = None,
+    ) -> None:
+        super().__init__(groot_policy=groot_policy, signal_group=signal_group, output_dir=output_dir)
+        self._reset_custom_state()
+
+    def _init_frame_buffers(self) -> dict[str, list[np.ndarray]]:
+        return {
+            'video.exterior_image_1_left': [],
+            'video.exterior_image_2_left': [],
+            'video.wrist_image_left': [],
+        }
+
+    def _reset_custom_state(self) -> None:
+        self._is_first_call = True
+
+    def _after_infer(self) -> None:
+        self._is_first_call = False
+
+    def _convert_observation(self, obs: dict) -> dict:
+        converted = {}
+        image_key_mapping = {
+            'observation/exterior_image_0_left': 'video.exterior_image_1_left',
+            'observation/exterior_image_1_left': 'video.exterior_image_2_left',
+            'observation/wrist_image_left': 'video.wrist_image_left',
+        }
+
+        for roboarena_key, droid_key in image_key_mapping.items():
+            if roboarena_key in obs:
+                data = obs[roboarena_key]
+                if isinstance(data, np.ndarray):
+                    if data.ndim == 4:
+                        self._frame_buffers[droid_key].extend(list(data))
+                    else:
+                        self._frame_buffers[droid_key].append(data)
+
+        num_frames = 1 if self._is_first_call else self.FRAMES_PER_CHUNK
+
+        for droid_key, buffer in self._frame_buffers.items():
+            if len(buffer) > 0:
+                if len(buffer) >= num_frames:
+                    frames_to_use = buffer[-num_frames:]
+                else:
+                    frames_to_use = buffer.copy()
+                    while len(frames_to_use) < num_frames:
+                        frames_to_use.insert(0, buffer[0])
+                converted[droid_key] = np.stack(frames_to_use, axis=0)
+
+        joint_pos = obs.get('observation/joint_position', np.zeros(7, dtype=np.float32))
+        if joint_pos.ndim == 1:
+            joint_pos = joint_pos.reshape(1, -1)
+        converted['state.joint_position'] = joint_pos.astype(np.float64)
+
+        gripper_pos = obs.get('observation/gripper_position', np.zeros(1, dtype=np.float32))
+        if gripper_pos.ndim == 1:
+            gripper_pos = gripper_pos.reshape(1, -1)
+        converted['state.gripper_position'] = gripper_pos.astype(np.float64)
+        converted['annotation.language.action_text'] = obs.get('prompt', '')
+        return converted
+
+    def _convert_action(self, action_dict: dict) -> np.ndarray:
+        joint_action = None
+        gripper_action = None
+        for key, value in action_dict.items():
+            if 'joint_position' in key:
+                joint_action = value
+            elif 'gripper_position' in key or 'gripper' in key:
+                gripper_action = value
+
+        if joint_action is None:
+            return np.zeros((1, 8), dtype=np.float32)
+
+        if isinstance(joint_action, torch.Tensor):
+            joint_action = joint_action.cpu().numpy()
+        if joint_action.ndim == 1:
+            joint_action = joint_action.reshape(1, -1)
+
+        num_steps = joint_action.shape[0]
+        if gripper_action is not None:
+            if isinstance(gripper_action, torch.Tensor):
+                gripper_action = gripper_action.cpu().numpy()
+            if gripper_action.ndim == 1:
+                gripper_action = gripper_action.reshape(-1, 1)
+            elif gripper_action.ndim == 0:
+                gripper_action = gripper_action.reshape(1, 1)
+        else:
+            gripper_action = np.zeros((num_steps, 1), dtype=np.float32)
+
+        return np.concatenate([joint_action, gripper_action], axis=-1).astype(np.float32)
+
+
+class AgiBotRoboarenaPolicy(DistributedRoboarenaPolicyBase):
+    """Adapter that converts websocket observations into AgiBot modality keys."""
+
+    VIDEO_KEY_MAPPING = {
+        'observation/top_head': 'video.top_head',
+        'observation/hand_left': 'video.hand_left',
+        'observation/hand_right': 'video.hand_right',
+    }
+    STATE_KEY_MAPPING = {
+        'observation/left_arm_joint_position': 'state.left_arm_joint_position',
+        'observation/right_arm_joint_position': 'state.right_arm_joint_position',
+        'observation/left_effector_position': 'state.left_effector_position',
+        'observation/right_effector_position': 'state.right_effector_position',
+        'observation/head_position': 'state.head_position',
+        'observation/waist_pitch': 'state.waist_pitch',
+        'observation/waist_lift': 'state.waist_lift',
+    }
+
+    def __init__(
+        self,
+        groot_policy: GrootSimPolicy,
+        signal_group: dist.ProcessGroup,
+        output_dir: str | None = None,
+    ) -> None:
+        super().__init__(groot_policy=groot_policy, signal_group=signal_group, output_dir=output_dir)
+        self._action_keys = list(self._policy.modality_configs.action.modality_keys)
+
+    def _lookup_obs_value(self, obs: dict, source_key: str, target_key: str) -> object:
+        if source_key in obs:
+            return obs[source_key]
+        return obs.get(target_key)
+
+    def _normalize_video(self, value: object, target_key: str) -> np.ndarray:
+        array = np.asarray(value)
+        if array.ndim == 3:
+            return np.expand_dims(array, axis=0)
+        if array.ndim == 4:
+            return array[-1:]
+        raise ValueError(f'AgiBot video input for {target_key} must have shape (H, W, C) or (T, H, W, C), got {array.shape}')
+
+    def _normalize_state(self, value: object, target_key: str) -> np.ndarray:
+        array = np.asarray(value)
+        if array.ndim == 0:
+            return array.reshape(1, 1).astype(np.float64)
+        if array.ndim == 1:
+            return array.reshape(1, -1).astype(np.float64)
+        if array.ndim == 2:
+            return array.astype(np.float64)
+        raise ValueError(f'AgiBot state input for {target_key} must be 1D or 2D, got {array.shape}')
+
+    def _prepare_video_chunk(self, video_pred: torch.Tensor) -> torch.Tensor:
+        if video_pred.ndim != 5:
+            raise ValueError(f'AgiBot video prediction must be 5D (B, C, T, H, W), got {tuple(video_pred.shape)}')
+        # Keep one newly predicted frame per step so the saved video tracks step progression
+        # instead of concatenating overlapping rollout windows.
+        return video_pred[:, :, :1].contiguous()
+
+    def _video_save_fps(self) -> int:
+        # Wan VAE expands latent time by roughly 4x during decode (T -> 4T-3), so
+        # use a higher playback fps for AgiBot to keep the rendered video close to
+        # the original step cadence.
+        return 20
+
+    def _convert_observation(self, obs: dict) -> dict:
+        converted = {}
+        missing_keys: list[str] = []
+
+        for source_key, target_key in self.VIDEO_KEY_MAPPING.items():
+            value = self._lookup_obs_value(obs, source_key, target_key)
+            if value is None:
+                missing_keys.append(source_key)
+                continue
+            converted[target_key] = self._normalize_video(value, target_key)
+
+        for source_key, target_key in self.STATE_KEY_MAPPING.items():
+            value = self._lookup_obs_value(obs, source_key, target_key)
+            if value is None:
+                missing_keys.append(source_key)
+                continue
+            converted[target_key] = self._normalize_state(value, target_key)
+
+        if missing_keys:
+            raise ValueError(
+                'AgiBot inference requires the following observation keys: '
+                + ', '.join(sorted(missing_keys))
+            )
+
+        converted['annotation.language.action_text'] = obs.get('prompt', obs.get('annotation.language.action_text', ''))
+        return converted
+
+    def _convert_action(self, action_dict: dict) -> np.ndarray:
+        flattened_chunks: list[np.ndarray] = []
+        expected_horizon: int | None = None
+        missing_keys = [key for key in self._action_keys if key not in action_dict]
+        if missing_keys:
+            raise RuntimeError('Missing AgiBot action outputs: ' + ', '.join(missing_keys))
+
+        for action_key in self._action_keys:
+            value = action_dict[action_key]
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().numpy()
+            array = np.asarray(value)
+            if array.ndim == 0:
+                array = array.reshape(1, 1)
+            elif array.ndim == 1:
+                array = array.reshape(-1, 1)
+            else:
+                array = array.reshape(array.shape[0], -1)
+
+            if expected_horizon is None:
+                expected_horizon = array.shape[0]
+            elif array.shape[0] != expected_horizon:
+                raise RuntimeError(
+                    f'Inconsistent AgiBot action horizon for {action_key}: expected {expected_horizon}, got {array.shape[0]}'
+                )
+            flattened_chunks.append(array.astype(np.float32))
+
+        return np.concatenate(flattened_chunks, axis=-1).astype(np.float32)
 
 
 class WebsocketPolicyServer:
@@ -716,6 +748,12 @@ def init_mesh() -> DeviceMesh:
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    if world_size not in (1, 2):
+        raise ValueError(
+            f"This DreamZero inference path only supports 1 or 2 GPUs, got world_size={world_size}. "
+            "The action head parallelization code explicitly supports ip_size 1 or 2 only. "
+            "Please launch with --nproc_per_node=2 (or 1)."
+        )
     print(f"Rank {rank}/{world_size} (PID: {os.getpid()}) setting device to {rank}")
 
     torch.cuda.set_device(rank)
@@ -737,18 +775,56 @@ def _health_check(connection: _server.ServerConnection, request: _server.Request
     return None
 
 
+def _create_wrapper_policy(
+    embodiment_tag: str,
+    groot_policy: GrootSimPolicy,
+    signal_group: dist.ProcessGroup,
+    output_dir: str | None,
+) -> DistributedRoboarenaPolicyBase:
+    if embodiment_tag == 'oxe_droid':
+        return ARDroidRoboarenaPolicy(groot_policy=groot_policy, signal_group=signal_group, output_dir=output_dir)
+    if embodiment_tag == 'agibot':
+        return AgiBotRoboarenaPolicy(groot_policy=groot_policy, signal_group=signal_group, output_dir=output_dir)
+    raise ValueError(f'Unsupported embodiment_tag: {embodiment_tag}')
+
+
+def _create_server_config(embodiment_tag: str) -> PolicyServerConfig:
+    if embodiment_tag == 'oxe_droid':
+        return PolicyServerConfig(
+            image_resolution=(180, 320),
+            needs_wrist_camera=True,
+            n_external_cameras=2,
+            needs_stereo_camera=False,
+            needs_session_id=True,
+            action_space='joint_position',
+        )
+    if embodiment_tag == 'agibot':
+        return PolicyServerConfig(
+            image_resolution=(640, 480),
+            needs_wrist_camera=False,
+            n_external_cameras=3,
+            needs_stereo_camera=False,
+            needs_session_id=True,
+            action_space='agibot_flattened',
+        )
+    raise ValueError(f'Unsupported embodiment_tag: {embodiment_tag}')
+
+
 def main(args: Args) -> None:
     # Set environment variable for DIT cache.
     os.environ["ENABLE_DIT_CACHE"] = "true" if args.enable_dit_cache else "false"
 
-    # Use TE cuDNN backend for attention.
-    os.environ["ATTENTION_BACKEND"] = "TE"
+    # Default to FlashAttention-2 when available, while still allowing callers
+    # to override the backend explicitly via the environment.
+    os.environ.setdefault("ATTENTION_BACKEND", "FA2")
 
     # Increase the recompile limit to 100 for inference due
     # to autoregressive nature of the model (several possible shapes).
     torch._dynamo.config.recompile_limit = 800
 
-    embodiment_tag = "oxe_droid"
+    embodiment_tag = args.embodiment_tag.lower()
+    if embodiment_tag not in {'oxe_droid', 'agibot'}:
+        raise ValueError(f'Unsupported embodiment_tag: {args.embodiment_tag}')
     model_path = args.model_path
     policy_metadata = {
         "embodiment": embodiment_tag,
@@ -788,25 +864,18 @@ def main(args: Args) -> None:
         output_dir = None
         logging.info(f"Rank {rank} starting as worker for distributed inference...")
     
-    # Create wrapper policy that converts between roboarena and AR_droid formats
-    wrapper_policy = ARDroidRoboarenaPolicy(
+    # Create an embodiment-specific wrapper that adapts websocket observations to the model schema.
+    wrapper_policy = _create_wrapper_policy(
+        embodiment_tag=embodiment_tag,
         groot_policy=policy,
         signal_group=signal_group,
         output_dir=output_dir,
     )
-    
-    # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
-    server_config = PolicyServerConfig(
-        image_resolution=(180, 320),  # AR_droid expects 180x320 images
-        needs_wrist_camera=True,
-        n_external_cameras=2,
-        needs_stereo_camera=False,
-        needs_session_id=True,  # Track session to reset state for new clients
-        action_space="joint_position",
-    )
+
+    server_config = _create_server_config(embodiment_tag)
     
     if rank == 0:
-        logging.info("Using roboarena policy server interface")
+        logging.info("Using roboarena policy server interface for %s", embodiment_tag)
         logging.info(f"Server config: {server_config}")
         roboarena_server = RoboarenaServer(
             policy=wrapper_policy,

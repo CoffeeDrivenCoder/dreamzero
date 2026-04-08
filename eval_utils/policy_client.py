@@ -14,13 +14,11 @@ from typing_extensions import override
 from openpi_client.base_policy import BasePolicy
 from openpi_client import msgpack_numpy
 
-# The websockets library by default sends a ping every 20 seconds and
-# expects a pong response within 20 seconds. However, the sever may not
-# send a pong response immediately if it is busy processing a request.
-# Increase the ping interval and timeout so that the client can wait
-# for a longer time before closing the connection.
-PING_INTERVAL_SECS = 60
-PING_TIMEOUT_SECS = 600
+# The websocket server runs synchronous inference and may block for a long time
+# during first-step compilation or large batched decode. Disable automatic client
+# keepalive pings so long-running requests aren't misclassified as dead connections.
+PING_INTERVAL_SECS = None
+PING_TIMEOUT_SECS = None
 
 class WebsocketClientPolicy(BasePolicy):
     """Implements the Policy interface by communicating with a server over websocket.
