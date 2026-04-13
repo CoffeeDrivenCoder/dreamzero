@@ -1,25 +1,25 @@
-# AgiBot Server Debug Notes
+# AgiBot 服务排障记录
 
-## Main Issues
+## 主要问题
 
-- `DreamZero-AgiBot/config.json` had null sub-weight paths, so the server tried to download Wan/T5/VAE files from Hugging Face even though local checkpoints already existed.
-- `experiment_cfg/conf.yaml` still contained old absolute paths under `/mnt/aws-lfs-02/shared/ckpts/...`.
-- The code used `torch._dynamo.config.recompile_limit`, but the local PyTorch version did not provide that field.
-- The default `ATTENTION_BACKEND=FA2` path could fail during real inference, and the error was wrapped by `torch.compile(..., fullgraph=True)` as `torch._dynamo.exc.Unsupported`.
+- `DreamZero-AgiBot/config.json` 里的子权重路径是 `null`，导致服务虽然指定了本地模型目录，仍然会回退到 Hugging Face 下载 Wan/T5/VAE 权重。
+- `experiment_cfg/conf.yaml` 里还残留了旧机器的绝对路径 `/mnt/aws-lfs-02/shared/ckpts/...`。
+- 当前环境里的 PyTorch 版本不支持 `torch._dynamo.config.recompile_limit`。
+- 默认 `ATTENTION_BACKEND=FA2` 时，真实推理阶段可能报错，并且会被 `torch.compile(..., fullgraph=True)` 包装成 `torch._dynamo.exc.Unsupported`。
 
-## Fix Summary
+## 已处理内容
 
-- Updated local checkpoint paths to:
+- 本地模型路径统一改为：
   - `/home/user/wangk/checkpoints/DreamZero-AgiBot`
   - `/home/user/wangk/checkpoints/Wan2.1-I2V-14B-480P`
   - `/home/user/wangk/checkpoints/umt5-xxl`
-- Fixed both:
+- 已修复以下配置文件中的本地路径：
   - `/home/user/wangk/checkpoints/DreamZero-AgiBot/config.json`
   - `/home/user/wangk/checkpoints/DreamZero-AgiBot/experiment_cfg/conf.yaml`
-- Set `load_pretrained_det_decode_layer_path: null`.
-- Recommended forcing `ATTENTION_BACKEND=torch` first to avoid FlashAttention-related runtime issues during validation.
+- 已将 `load_pretrained_det_decode_layer_path` 设为 `null`。
+- 当前建议先使用 `ATTENTION_BACKEND=torch`，避免 FlashAttention 兼容性问题影响排查。
 
-## Current Start Command
+## 当前启动命令
 
 ```bash
 cd /home/user/wangk/dreamzero
@@ -36,7 +36,7 @@ CUDA_VISIBLE_DEVICES=0,1 /home/user/miniconda3/envs/dreamzero/bin/python -m torc
   --enable-dit-cache
 ```
 
-## Notes
+## 说明
 
-- If `flash-attn` is later verified to match `torch 2.8`, `ATTENTION_BACKEND` can be switched back from `torch` to `FA2`.
-- If a new error appears now, it is no longer caused by missing local model files or wrong checkpoint paths.
+- 如果后续确认 `flash-attn` 与 `torch 2.8` 匹配，可以再把 `ATTENTION_BACKEND` 从 `torch` 切回 `FA2`。
+- 现在如果再出现新报错，通常已经不是本地模型路径或缺少 checkpoint 文件导致的。
