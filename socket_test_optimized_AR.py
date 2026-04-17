@@ -307,7 +307,7 @@ class AgiBotRoboarenaPolicy(DistributedRoboarenaPolicyBase):
         if array.ndim == 3:
             return np.expand_dims(array, axis=0)
         if array.ndim == 4:
-            return array[-1:]
+            return array
         raise ValueError(f'AgiBot video input for {target_key} must have shape (H, W, C) or (T, H, W, C), got {array.shape}')
 
     def _normalize_state(self, value: object, target_key: str) -> np.ndarray:

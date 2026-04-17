@@ -8,6 +8,7 @@ observation schema, and sends them to the websocket policy server.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import datetime
 import json
 import logging
@@ -15,6 +16,7 @@ import os
 import select
 import sys
 import termios
+import threading
 import time
 import tty
 import uuid
@@ -53,8 +55,8 @@ ArmOrder = Literal["left_right", "right_left"]
 DEFAULT_SDK_ARM_ORDER: ArmOrder = "left_right"
 ARM_JOINT_COUNT = 14
 RIGHT_ARM_START = 7
-MOVE_ARM_INTERVAL_S = 0.01
-MOVE_ARM_TIMEOUT_S = 5.0
+DEFAULT_MOVE_ARM_INTERVAL_S = 0.01
+DEFAULT_MOVE_ARM_TIMEOUT_S = 5.0
 POSITION_TOLERANCE_RAD = 5e-3
 RUCKIG_MAX_VELOCITY = 2.0
 RUCKIG_MAX_ACCELERATION = 1.0
@@ -100,6 +102,287 @@ class _KeyboardMonitor:
             return False
         key = sys.stdin.read(1).lower()
         return key == "q"
+
+
+@dataclass(frozen=True)
+class ObservationSample:
+    head_img: np.ndarray
+    left_img: np.ndarray
+    right_img: np.ndarray
+    head_ts: int
+    left_ts: int
+    right_ts: int
+    sampled_at: float
+
+
+@dataclass(frozen=True)
+class PreparedObservation:
+    step: int
+    mode: str
+    obs: dict[str, object]
+    sequence: tuple[ObservationSample, ...]
+    latest_sampled_at: float
+    observation_sample_interval: float
+    observation_history_span: float
+    observation_consumed_interval: float
+    arm_pos_sdk: np.ndarray
+    arm_pos_policy: np.ndarray
+    obs_arm_policy: np.ndarray
+    head_pos: np.ndarray
+    waist_pos: np.ndarray
+    gripper_pos_sdk: np.ndarray
+    obs_gripper_policy: np.ndarray
+    captured_at: float
+
+
+@dataclass(frozen=True)
+class InferenceRequest:
+    request_id: str
+    prepared: PreparedObservation
+
+
+@dataclass(frozen=True)
+class InferenceResult:
+    request: InferenceRequest
+    actions: np.ndarray
+    duration_s: float
+    completed_at: float
+
+
+@dataclass(frozen=True)
+class SpeculativeConfig:
+    enabled: bool = False
+    prefetch_fraction: float = 0.7
+    max_boundary_wait_s: float = 0.15
+    max_state_age_s: float = 1.5
+    arm_state_tolerance: float = 0.12
+    waist_state_tolerance: float = 0.03
+
+
+class _ObservationSampler:
+    """Sample camera observations on a fixed wall-clock schedule in the background."""
+
+    def __init__(
+        self,
+        camera: Camera,
+        target_w: int | None,
+        target_h: int | None,
+        interval_s: float,
+    ) -> None:
+        self._camera = camera
+        self._target_w = target_w
+        self._target_h = target_h
+        self._interval_s = max(interval_s, 1e-3)
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._latest_sample: ObservationSample | None = None
+        self._samples: deque[ObservationSample] = deque()
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="observation-sampler", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    def wait_until_ready(self, timeout_s: float = 5.0) -> ObservationSample:
+        if not self._ready_event.wait(timeout=timeout_s):
+            raise RuntimeError(f"Observation sampler did not produce a frame within {timeout_s}s.")
+        sample = self.get_latest_sample()
+        if sample is None:
+            raise RuntimeError("Observation sampler reported ready without a sample.")
+        return sample
+
+    def wait_until_history_ready(self, history_size: int, timeout_s: float = 5.0) -> list[ObservationSample]:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            sequence = self.get_latest_sequence(history_size)
+            if len(sequence) >= history_size:
+                return sequence
+            time.sleep(0.01)
+        raise RuntimeError(
+            f"Observation sampler did not accumulate {history_size} samples within {timeout_s}s."
+        )
+
+    def get_latest_sample(self) -> ObservationSample | None:
+        with self._lock:
+            return self._latest_sample
+
+    def get_latest_sequence(self, history_size: int) -> list[ObservationSample]:
+        if history_size <= 0:
+            raise ValueError(f"history_size must be positive, got {history_size}")
+        with self._lock:
+            samples = list(self._samples)
+        if not samples:
+            return []
+        if len(samples) >= history_size:
+            return samples[-history_size:]
+        pad = [samples[0]] * (history_size - len(samples))
+        return pad + samples
+
+    def _resize_if_needed(self, image: np.ndarray) -> np.ndarray:
+        if self._target_w is None or self._target_h is None:
+            return image
+        return cv2.resize(image, (self._target_w, self._target_h), interpolation=cv2.INTER_AREA)
+
+    def _run(self) -> None:
+        next_sample_time = time.monotonic()
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+            sleep_s = next_sample_time - now
+            if sleep_s > 0:
+                if self._stop_event.wait(timeout=sleep_s):
+                    break
+
+            sample_wall_time = time.time()
+            head_img, head_ts = self._camera.get_latest_image("head")
+            left_img, left_ts = self._camera.get_latest_image("hand_left")
+            right_img, right_ts = self._camera.get_latest_image("hand_right")
+
+            if head_img is not None and left_img is not None and right_img is not None:
+                sample = ObservationSample(
+                    head_img=self._resize_if_needed(head_img),
+                    left_img=self._resize_if_needed(left_img),
+                    right_img=self._resize_if_needed(right_img),
+                    head_ts=int(head_ts),
+                    left_ts=int(left_ts),
+                    right_ts=int(right_ts),
+                    sampled_at=sample_wall_time,
+                )
+                with self._lock:
+                    self._latest_sample = sample
+                    self._samples.append(sample)
+                    max_samples = 32
+                    while len(self._samples) > max_samples:
+                        self._samples.popleft()
+                self._ready_event.set()
+            else:
+                logging.warning("Observation sampler got None frame(s); keeping previous sampled observation.")
+
+            next_sample_time += self._interval_s
+            now = time.monotonic()
+            if next_sample_time < now - self._interval_s:
+                next_sample_time = now + self._interval_s
+
+
+class _InferenceWorker:
+    """Single-owner background worker for websocket inference calls."""
+
+    def __init__(self, client: WebsocketClientPolicy) -> None:
+        self._client = client
+        self._condition = threading.Condition()
+        self._pending: InferenceRequest | None = None
+        self._active_request_id: str | None = None
+        self._results: dict[str, InferenceResult] = {}
+        self._errors: dict[str, BaseException] = {}
+        self._ignored_request_ids: set[str] = set()
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, name="policy-inference-worker", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        with self._condition:
+            self._stop = True
+            self._condition.notify_all()
+        self._thread.join(timeout=2.0)
+
+    def submit(self, prepared: PreparedObservation) -> InferenceRequest | None:
+        request = InferenceRequest(request_id=str(uuid.uuid4()), prepared=prepared)
+        with self._condition:
+            if self._pending is not None or self._active_request_id is not None:
+                return None
+            self._pending = request
+            self._condition.notify_all()
+        return request
+
+    def wait_for_result(self, request_id: str, timeout_s: float | None = None) -> InferenceResult | None:
+        deadline = None if timeout_s is None else time.time() + max(timeout_s, 0.0)
+        with self._condition:
+            while True:
+                if request_id in self._results:
+                    return self._results.pop(request_id)
+                if request_id in self._errors:
+                    raise RuntimeError(
+                        f"Inference worker failed for request {request_id}"
+                    ) from self._errors.pop(request_id)
+                if self._stop:
+                    return None
+                if deadline is not None:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        return None
+                else:
+                    remaining = None
+                self._condition.wait(timeout=remaining)
+
+    def wait_until_idle(self, timeout_s: float | None = None) -> bool:
+        deadline = None if timeout_s is None else time.time() + max(timeout_s, 0.0)
+        with self._condition:
+            while self._pending is not None or self._active_request_id is not None:
+                if self._stop:
+                    return False
+                if deadline is not None:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        return False
+                else:
+                    remaining = None
+                self._condition.wait(timeout=remaining)
+            return True
+
+    def forget_request(self, request_id: str) -> None:
+        with self._condition:
+            self._ignored_request_ids.add(request_id)
+            self._results.pop(request_id, None)
+            self._errors.pop(request_id, None)
+            self._condition.notify_all()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while not self._stop and self._pending is None:
+                    self._condition.wait()
+                if self._stop:
+                    return
+                request = self._pending
+                self._pending = None
+                assert request is not None
+                self._active_request_id = request.request_id
+
+            try:
+                started_at = time.time()
+                actions = self._client.infer(request.prepared.obs)
+                actions = np.asarray(actions, dtype=np.float32)
+                result = InferenceResult(
+                    request=request,
+                    actions=actions,
+                    duration_s=time.time() - started_at,
+                    completed_at=time.time(),
+                )
+                with self._condition:
+                    if request.request_id in self._ignored_request_ids:
+                        self._ignored_request_ids.remove(request.request_id)
+                    else:
+                        self._results[request.request_id] = result
+                    self._active_request_id = None
+                    self._condition.notify_all()
+            except BaseException as exc:
+                with self._condition:
+                    if request.request_id in self._ignored_request_ids:
+                        self._ignored_request_ids.remove(request.request_id)
+                    else:
+                        self._errors[request.request_id] = exc
+                    self._active_request_id = None
+                    self._condition.notify_all()
 
 
 def _sdk_to_policy_arm(arm_pos: list | np.ndarray, sdk_arm_order: ArmOrder) -> np.ndarray:
@@ -205,6 +488,10 @@ class Limits:
     head_delta: float
     waist_pitch_delta: float
     waist_lift_delta: float
+    linear_velocity: float
+    angular_velocity: float
+    arm_trajectory_interval: float
+    arm_close_timeout: float
 
 
 @dataclass(frozen=True)
@@ -254,12 +541,179 @@ def _clip_delta(target: np.ndarray, current: np.ndarray, max_delta: float) -> np
     return np.asarray(current, dtype=np.float32) + delta
 
 
+def _clip_wheel_command(target: np.ndarray, limits: Limits) -> np.ndarray:
+    wheel = np.asarray(target, dtype=np.float32)
+    return np.asarray(
+        [
+            float(np.clip(wheel[0], -limits.linear_velocity, limits.linear_velocity)),
+            float(np.clip(wheel[1], -limits.angular_velocity, limits.angular_velocity)),
+        ],
+        dtype=np.float32,
+    )
+
+
+def _is_finite_vector(values: np.ndarray | list[float]) -> bool:
+    arr = np.asarray(values, dtype=np.float32)
+    return bool(np.all(np.isfinite(arr)))
+
+
 def _sleep_with_stop(duration_s: float, should_stop: Callable[[], bool]) -> None:
     deadline = time.time() + max(duration_s, 0.0)
     while time.time() < deadline:
         if should_stop():
             raise _StopRequested
         time.sleep(min(0.02, max(deadline - time.time(), 0.0)))
+
+
+def _capture_prepared_observation(
+    *,
+    step: int,
+    mode: str,
+    sampler: _ObservationSampler,
+    robot: Robot,
+    observation_history: int,
+    previous_latest_sampled_at: float | None,
+    prompt: str,
+    session_id: str,
+    sdk_arm_order: ArmOrder,
+    obs_flip_config: ObsFlipConfig,
+) -> PreparedObservation:
+    sequence = sampler.get_latest_sequence(observation_history)
+    if len(sequence) != observation_history:
+        raise RuntimeError(
+            f"Observation sampler history is not ready yet: expected {observation_history}, got {len(sequence)}"
+        )
+
+    latest_sample = sequence[-1]
+    observation_sample_interval = (
+        sequence[-1].sampled_at - sequence[-2].sampled_at if len(sequence) >= 2 else 0.0
+    )
+    observation_history_span = (
+        sequence[-1].sampled_at - sequence[0].sampled_at if len(sequence) >= 2 else 0.0
+    )
+    observation_consumed_interval = (
+        latest_sample.sampled_at - previous_latest_sampled_at if previous_latest_sampled_at is not None else 0.0
+    )
+
+    head_imgs = np.stack([sample.head_img for sample in sequence], axis=0)
+    left_imgs = np.stack([sample.left_img for sample in sequence], axis=0)
+    right_imgs = np.stack([sample.right_img for sample in sequence], axis=0)
+
+    arm_pos, _ = robot.arm_joint_states()
+    head_pos, _ = robot.head_joint_states()
+    waist_pos, _ = robot.waist_joint_states()
+    gripper_pos, _ = robot.gripper_states()
+
+    arm_pos_sdk = np.asarray(arm_pos, dtype=np.float32)
+    arm_pos_policy = _sdk_to_policy_arm(arm_pos_sdk, sdk_arm_order)
+    obs_arm_policy = _apply_obs_joint_sign_flips(arm_pos_policy, obs_flip_config)
+    gripper_pos_sdk = np.asarray(gripper_pos, dtype=np.float32)
+    obs_gripper_policy = _sdk_gripper_to_policy_obs(gripper_pos_sdk)
+    head_pos_arr = np.asarray(head_pos, dtype=np.float32)
+    waist_pos_arr = np.asarray(waist_pos, dtype=np.float32)
+
+    obs = _build_obs(
+        head_img=head_imgs,
+        left_img=left_imgs,
+        right_img=right_imgs,
+        arm_pos=arm_pos_sdk,
+        head_pos=head_pos_arr,
+        waist_pos=waist_pos_arr,
+        gripper_pos=gripper_pos_sdk,
+        prompt=prompt,
+        session_id=session_id,
+        sdk_arm_order=sdk_arm_order,
+        obs_flip_config=obs_flip_config,
+    )
+
+    return PreparedObservation(
+        step=step,
+        mode=mode,
+        obs=obs,
+        sequence=tuple(sequence),
+        latest_sampled_at=latest_sample.sampled_at,
+        observation_sample_interval=observation_sample_interval,
+        observation_history_span=observation_history_span,
+        observation_consumed_interval=observation_consumed_interval,
+        arm_pos_sdk=arm_pos_sdk,
+        arm_pos_policy=arm_pos_policy,
+        obs_arm_policy=obs_arm_policy,
+        head_pos=head_pos_arr,
+        waist_pos=waist_pos_arr,
+        gripper_pos_sdk=gripper_pos_sdk,
+        obs_gripper_policy=obs_gripper_policy,
+        captured_at=time.time(),
+    )
+
+
+def _read_policy_robot_state(robot: Robot, sdk_arm_order: ArmOrder) -> dict[str, np.ndarray]:
+    arm_pos, _ = robot.arm_joint_states()
+    waist_pos, _ = robot.waist_joint_states()
+    head_pos, _ = robot.head_joint_states()
+    gripper_pos, _ = robot.gripper_states()
+    return {
+        "arm_policy": _sdk_to_policy_arm(np.asarray(arm_pos, dtype=np.float32), sdk_arm_order),
+        "waist": np.asarray(waist_pos, dtype=np.float32),
+        "head": np.asarray(head_pos, dtype=np.float32),
+        "gripper_sdk": np.asarray(gripper_pos, dtype=np.float32),
+    }
+
+
+def _evaluate_speculative_result(
+    *,
+    result: InferenceResult,
+    robot: Robot,
+    sdk_arm_order: ArmOrder,
+    config: SpeculativeConfig,
+) -> dict[str, object]:
+    boundary_state = _read_policy_robot_state(robot, sdk_arm_order)
+    prepared = result.request.prepared
+    arm_delta_max = float(np.max(np.abs(boundary_state["arm_policy"] - prepared.arm_pos_policy)))
+    waist_delta_max = float(np.max(np.abs(boundary_state["waist"] - prepared.waist_pos)))
+    head_delta_max = float(np.max(np.abs(boundary_state["head"] - prepared.head_pos)))
+    gripper_delta_max = float(np.max(np.abs(boundary_state["gripper_sdk"] - prepared.gripper_pos_sdk)))
+    state_age_s = float(time.time() - prepared.captured_at)
+
+    accepted = True
+    reasons: list[str] = []
+    if arm_delta_max > config.arm_state_tolerance:
+        accepted = False
+        reasons.append(f"arm_delta_max={arm_delta_max:.4f}>{config.arm_state_tolerance:.4f}")
+    if waist_delta_max > config.waist_state_tolerance:
+        accepted = False
+        reasons.append(f"waist_delta_max={waist_delta_max:.4f}>{config.waist_state_tolerance:.4f}")
+    if state_age_s > config.max_state_age_s:
+        accepted = False
+        reasons.append(f"state_age_s={state_age_s:.3f}>{config.max_state_age_s:.3f}")
+
+    return {
+        "accepted": accepted,
+        "reason": "accepted" if accepted else "; ".join(reasons),
+        "arm_delta_max": arm_delta_max,
+        "waist_delta_max": waist_delta_max,
+        "head_delta_max": head_delta_max,
+        "gripper_delta_max": gripper_delta_max,
+        "state_age_s": state_age_s,
+        "boundary_arm_policy": boundary_state["arm_policy"],
+        "boundary_waist": boundary_state["waist"],
+        "boundary_head": boundary_state["head"],
+        "boundary_gripper_sdk": boundary_state["gripper_sdk"],
+    }
+
+
+def _parse_action_row(row: np.ndarray, horizon: int) -> dict[str, np.ndarray]:
+    row = np.asarray(row, dtype=np.float32).reshape(-1)
+    if row.shape[0] < 22:
+        raise ValueError(f"Expected at least 22 dims, got {row.shape[0]}")
+    return {
+        "left_arm": row[0:7],
+        "right_arm": row[7:14],
+        "gripper": row[14:16],
+        "head": row[16:18],
+        "waist": row[18:20],
+        "wheel": row[20:22],
+        "horizon": np.asarray([horizon], dtype=np.int32),
+    }
 
 
 def _parse_action_first(actions: np.ndarray) -> dict[str, np.ndarray]:
@@ -270,17 +724,7 @@ def _parse_action_first(actions: np.ndarray) -> dict[str, np.ndarray]:
         raise ValueError(f"Expected action shape (T, D), got {arr.shape}")
     if arr.shape[1] < 22:
         raise ValueError(f"Expected at least 22 dims, got {arr.shape}")
-
-    first = arr[0]
-    return {
-        "left_arm": first[0:7],
-        "right_arm": first[7:14],
-        "gripper": first[14:16],
-        "head": first[16:18],
-        "waist": first[18:20],
-        "wheel": first[20:22],
-        "horizon": np.asarray([arr.shape[0]], dtype=np.int32),
-    }
+    return _parse_action_row(arr[0], arr.shape[0])
 
 
 def _select_gripper_command(actions: np.ndarray, gripper_config: GripperConfig) -> dict[str, np.ndarray]:
@@ -331,9 +775,10 @@ def _build_safe_arm_targets(
 def _build_segment_trajectory(
     current_positions: np.ndarray,
     target_positions: np.ndarray,
+    interval_s: float,
 ) -> list[list[float]]:
     dof = ARM_JOINT_COUNT
-    rk = ruckig.Ruckig(dof, MOVE_ARM_INTERVAL_S)
+    rk = ruckig.Ruckig(dof, interval_s)
     rk_input = ruckig.InputParameter(dof)
     rk_output = ruckig.OutputParameter(dof)
 
@@ -381,9 +826,10 @@ def _wait_arm_close(
     robot: Robot,
     target_policy_arm: np.ndarray,
     sdk_arm_order: ArmOrder,
+    timeout_s: float,
     should_stop: Callable[[], bool],
 ) -> dict[str, np.ndarray | float | bool]:
-    deadline = time.time() + MOVE_ARM_TIMEOUT_S
+    deadline = time.time() + max(timeout_s, 0.0)
     last_policy_arm = _sdk_to_policy_arm(np.asarray(robot.arm_joint_states()[0], dtype=np.float32), sdk_arm_order)
     reached = False
 
@@ -413,34 +859,105 @@ def _execute_arm_trajectory(
     actions: np.ndarray,
     limits: Limits,
     sdk_arm_order: ArmOrder,
+    enable_wheel: bool,
     should_stop: Callable[[], bool],
+    on_row_complete: Callable[[int, int], None] | None = None,
+    prefetch_fraction: float = 1.0,
 ) -> dict[str, np.ndarray | int | float | bool]:
+    arr = np.asarray(actions, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[1] < 22:
+        raise RuntimeError(f"Invalid action shape: {arr.shape}")
+
     arm_cur, _ = robot.arm_joint_states()
     arm_cur_sdk = np.asarray(arm_cur, dtype=np.float32)
     arm_cur_policy = _sdk_to_policy_arm(arm_cur_sdk, sdk_arm_order)
 
     safe_policy_targets = _build_safe_arm_targets(actions, arm_cur_policy, limits)
-    move_arm_points = _build_move_arm_points(safe_policy_targets, sdk_arm_order)
 
-    for point in move_arm_points:
-        if should_stop():
-            raise _StopRequested
-        robot.move_arm(point)
-        _sleep_with_stop(MOVE_ARM_INTERVAL_S, should_stop)
+    move_arm_points = 0
+    waist_rows_sent = 0
+    wheel_rows_sent = 0
+    first_waist_sent: np.ndarray | None = None
+    last_waist_sent: np.ndarray | None = None
+    first_wheel_sent: np.ndarray | None = None
+    last_wheel_sent: np.ndarray | None = None
+
+    prev_sdk: np.ndarray | None = None
+    total_rows = safe_policy_targets.shape[0]
+    trigger_row = min(total_rows, max(1, int(np.ceil(total_rows * min(max(prefetch_fraction, 0.0), 1.0)))))
+    prefetch_triggered = False
+    for row_index, safe_policy_target in enumerate(safe_policy_targets):
+        target_sdk = _policy_to_sdk_arm(safe_policy_target, sdk_arm_order)
+        if prev_sdk is None:
+            segment = [target_sdk.astype(np.float32).tolist()]
+        else:
+            segment = _build_segment_trajectory(prev_sdk, target_sdk, limits.arm_trajectory_interval)
+            if segment:
+                segment = segment[1:]
+
+        for point in segment:
+            if should_stop():
+                raise _StopRequested
+            robot.move_arm(point)
+            move_arm_points += 1
+            _sleep_with_stop(limits.arm_trajectory_interval, should_stop)
+
+        row_parts = _parse_action_row(arr[row_index], arr.shape[0])
+
+        waist_target = row_parts["waist"].astype(np.float32)
+        if _is_finite_vector(waist_target):
+            waist_cur, _ = robot.waist_joint_states()
+            waist_cur = np.asarray(waist_cur, dtype=np.float32)
+            if waist_cur.shape[0] == 2:
+                safe_waist = np.asarray(
+                    [
+                        _clip_delta(waist_target[:1], waist_cur[:1], limits.waist_pitch_delta)[0],
+                        _clip_delta(waist_target[1:], waist_cur[1:], limits.waist_lift_delta)[0],
+                    ],
+                    dtype=np.float32,
+                )
+                robot.move_waist(safe_waist.tolist())
+                waist_rows_sent += 1
+                if first_waist_sent is None:
+                    first_waist_sent = safe_waist
+                last_waist_sent = safe_waist
+
+        wheel_target = row_parts["wheel"].astype(np.float32)
+        if enable_wheel and _is_finite_vector(wheel_target):
+            safe_wheel = _clip_wheel_command(wheel_target, limits)
+            robot.move_wheel(float(safe_wheel[0]), float(safe_wheel[1]))
+            wheel_rows_sent += 1
+            if first_wheel_sent is None:
+                first_wheel_sent = safe_wheel
+            last_wheel_sent = safe_wheel
+
+        prev_sdk = np.asarray(target_sdk, dtype=np.float32)
+        if on_row_complete is not None and not prefetch_triggered and (row_index + 1) >= trigger_row:
+            on_row_complete(row_index + 1, total_rows)
+            prefetch_triggered = True
 
     wait_result = _wait_arm_close(
         robot=robot,
         target_policy_arm=safe_policy_targets[-1],
         sdk_arm_order=sdk_arm_order,
+        timeout_s=limits.arm_close_timeout,
         should_stop=should_stop,
     )
+    waist_after, _ = robot.waist_joint_states()
     return {
         "arm_cur_sdk": arm_cur_sdk,
         "arm_cur_policy": arm_cur_policy,
         "first_arm_policy": safe_policy_targets[0],
         "last_arm_policy": safe_policy_targets[-1],
         "target_rows": np.asarray([safe_policy_targets.shape[0]], dtype=np.int32),
-        "move_arm_points": np.asarray([len(move_arm_points)], dtype=np.int32),
+        "move_arm_points": np.asarray([move_arm_points], dtype=np.int32),
+        "waist_rows_sent": np.asarray([waist_rows_sent], dtype=np.int32),
+        "wheel_rows_sent": np.asarray([wheel_rows_sent], dtype=np.int32),
+        "first_waist_sent": np.zeros(2, dtype=np.float32) if first_waist_sent is None else first_waist_sent,
+        "last_waist_sent": np.zeros(2, dtype=np.float32) if last_waist_sent is None else last_waist_sent,
+        "first_wheel_sent": np.zeros(2, dtype=np.float32) if first_wheel_sent is None else first_wheel_sent,
+        "last_wheel_sent": np.zeros(2, dtype=np.float32) if last_wheel_sent is None else last_wheel_sent,
+        "waist_after": np.asarray(waist_after, dtype=np.float32),
         "arm_after_policy": wait_result["arm_after_policy"],
         "arm_error": wait_result["arm_error"],
         "left_error": wait_result["left_error"],
@@ -457,26 +974,13 @@ def _apply_aux_actions(
     enable_gripper: bool,
 ) -> dict[str, np.ndarray]:
     head_cur, _ = robot.head_joint_states()
-    waist_cur, _ = robot.waist_joint_states()
 
     head_cur = np.asarray(head_cur, dtype=np.float32)
-    waist_cur = np.asarray(waist_cur, dtype=np.float32)
     if head_cur.shape[0] != 2:
         raise RuntimeError(f"head_joint_states length must be 2, got {head_cur.shape[0]}")
-    if waist_cur.shape[0] != 2:
-        raise RuntimeError(f"waist_joint_states length must be 2, got {waist_cur.shape[0]}")
 
     head_target = parsed["head"].astype(np.float32)
     safe_head = _clip_delta(head_target, head_cur, limits.head_delta)
-
-    waist_target = parsed["waist"].astype(np.float32)
-    safe_waist = np.asarray(
-        [
-            _clip_delta(waist_target[:1], waist_cur[:1], limits.waist_pitch_delta)[0],
-            _clip_delta(waist_target[1:], waist_cur[1:], limits.waist_lift_delta)[0],
-        ],
-        dtype=np.float32,
-    )
 
     safe_gripper_policy = np.clip(gripper_command_policy, 0.0, 1.0).astype(np.float32)
     safe_gripper_sdk = _policy_gripper_to_sdk(safe_gripper_policy)
@@ -484,14 +988,11 @@ def _apply_aux_actions(
     if enable_gripper:
         robot.move_gripper(safe_gripper_sdk.tolist())
     robot.move_head(safe_head.tolist())
-    robot.move_waist(safe_waist.tolist())
 
     return {
         "gripper": safe_gripper_sdk,
         "gripper_policy": safe_gripper_policy,
         "head": safe_head,
-        "waist": safe_waist,
-        "wheel": parsed["wheel"].astype(np.float32),
     }
 
 
@@ -510,10 +1011,14 @@ def run_client(
     prompt: str,
     apply_actions: bool,
     enable_gripper: bool,
+    enable_wheel: bool,
     limits: Limits,
     sdk_arm_order: ArmOrder,
     obs_flip_config: ObsFlipConfig,
     gripper_config: GripperConfig,
+    observation_fps: float,
+    observation_history: int,
+    speculative_config: SpeculativeConfig,
 ) -> None:
     logging.info("Connecting to AgiBot server at %s:%s...", host, port)
     client = WebsocketClientPolicy(host=host, port=port)
@@ -534,6 +1039,19 @@ def run_client(
     _wait_for_image(camera, "hand_left")
     _wait_for_image(camera, "hand_right")
 
+    observation_interval_s = 1.0 / max(observation_fps, 1e-6)
+    sampler = _ObservationSampler(
+        camera=camera,
+        target_w=target_w,
+        target_h=target_h,
+        interval_s=observation_interval_s,
+    )
+    sampler.start()
+    sampler.wait_until_ready()
+    initial_sequence = sampler.wait_until_history_ready(observation_history)
+    worker = _InferenceWorker(client)
+    worker.start()
+
     session_id = str(uuid.uuid4())
     step = 0
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -543,14 +1061,20 @@ def run_client(
     action_records: list[dict[str, object]] = []
     logging.info("Starting live client, session_id=%s", session_id)
     logging.info(
-        "Client config: sdk_arm_order=%s apply_actions=%s enable_gripper=%s obs_flip_left=%s obs_flip_right=%s gripper_threshold=%.2f gripper_close_when_high=%s action_log_path=%s",
+        "Client config: sdk_arm_order=%s apply_actions=%s enable_gripper=%s enable_wheel=%s observation_fps=%.2f observation_interval=%.3fs arm_interval=%.4fs arm_close_timeout=%.2fs obs_flip_left=%s obs_flip_right=%s gripper_threshold=%.2f gripper_close_when_high=%s speculative_enabled=%s action_log_path=%s",
         sdk_arm_order,
         apply_actions,
         enable_gripper,
+        enable_wheel,
+        observation_fps,
+        observation_interval_s,
+        limits.arm_trajectory_interval,
+        limits.arm_close_timeout,
         list(obs_flip_config.left_joint_indices),
         list(obs_flip_config.right_joint_indices),
         gripper_config.close_threshold,
         gripper_config.close_when_high,
+        speculative_config.enabled,
         action_log_path,
     )
     _maybe_warn_sdk_order(sdk_arm_order)
@@ -558,64 +1082,65 @@ def run_client(
     try:
         with _KeyboardMonitor() as keyboard_monitor:
             logging.info("Continuous inference started. Press 'q' to stop the client.")
+            last_used_sequence_latest_sampled_at: float | None = initial_sequence[-1].sampled_at
+            prefetched_result: InferenceResult | None = None
             while True:
                 if keyboard_monitor.consume_stop_request():
                     logging.info("Stop hotkey received before inference. Exiting.")
                     break
 
-                t0 = time.time()
+                if prefetched_result is not None:
+                    infer_result = prefetched_result
+                    prepared = infer_result.request.prepared
+                    inference_source = "speculative"
+                    prefetched_result = None
+                else:
+                    prepared = _capture_prepared_observation(
+                        step=step,
+                        mode="sync",
+                        sampler=sampler,
+                        robot=robot,
+                        observation_history=observation_history,
+                        previous_latest_sampled_at=last_used_sequence_latest_sampled_at,
+                        prompt=prompt,
+                        session_id=session_id,
+                        sdk_arm_order=sdk_arm_order,
+                        obs_flip_config=obs_flip_config,
+                    )
+                    request = worker.submit(prepared)
+                    if request is None:
+                        if not worker.wait_until_idle(timeout_s=max(speculative_config.max_boundary_wait_s, 0.5)):
+                            raise RuntimeError("Inference worker stayed busy before sync inference submission.")
+                        request = worker.submit(prepared)
+                    if request is None:
+                        raise RuntimeError("Inference worker is unexpectedly busy before sync inference.")
+                    infer_result = worker.wait_for_result(request.request_id, timeout_s=None)
+                    if infer_result is None:
+                        raise RuntimeError("Inference worker stopped before sync inference completed.")
+                    inference_source = "sync"
 
-                head_img, _ = camera.get_latest_image("head")
-                left_img, _ = camera.get_latest_image("hand_left")
-                right_img, _ = camera.get_latest_image("hand_right")
-                if head_img is None or left_img is None or right_img is None:
-                    logging.warning("Camera returned None frame(s); skipping step.")
-                    time.sleep(0.01)
-                    continue
-
-                if target_w is not None and target_h is not None:
-                    head_img = cv2.resize(head_img, (target_w, target_h), interpolation=cv2.INTER_AREA)
-                    left_img = cv2.resize(left_img, (target_w, target_h), interpolation=cv2.INTER_AREA)
-                    right_img = cv2.resize(right_img, (target_w, target_h), interpolation=cv2.INTER_AREA)
-
-                arm_pos, _ = robot.arm_joint_states()
-                head_pos, _ = robot.head_joint_states()
-                waist_pos, _ = robot.waist_joint_states()
-                gripper_pos, _ = robot.gripper_states()
-
-                arm_pos_sdk = np.asarray(arm_pos, dtype=np.float32)
-                arm_pos_policy = _sdk_to_policy_arm(arm_pos_sdk, sdk_arm_order)
-                obs_arm_policy = _apply_obs_joint_sign_flips(arm_pos_policy, obs_flip_config)
-                gripper_pos_sdk = np.asarray(gripper_pos, dtype=np.float32)
-                obs_gripper_policy = _sdk_gripper_to_policy_obs(gripper_pos_sdk)
-
-                obs = _build_obs(
-                    head_img=head_img,
-                    left_img=left_img,
-                    right_img=right_img,
-                    arm_pos=arm_pos_sdk,
-                    head_pos=head_pos,
-                    waist_pos=waist_pos,
-                    gripper_pos=gripper_pos,
-                    prompt=prompt,
-                    session_id=session_id,
-                    sdk_arm_order=sdk_arm_order,
-                    obs_flip_config=obs_flip_config,
-                )
-
-                actions = client.infer(obs)
-                actions = np.asarray(actions, dtype=np.float32)
+                actions = infer_result.actions
                 parsed = _parse_action_first(actions)
                 gripper_plan = _select_gripper_command(actions, gripper_config)
-                dt = time.time() - t0
+                last_used_sequence_latest_sampled_at = prepared.latest_sampled_at
+                latest_sample = prepared.sequence[-1]
                 logging.info(
-                    "Step %s | action shape=%s horizon=%s range=[%.4f, %.4f] dt=%.3fs",
+                    "Step %s | source=%s action shape=%s horizon=%s range=[%.4f, %.4f] infer_dt=%.3fs obs_sample_interval=%.3fs obs_history_span=%.3fs obs_consumed_interval=%.3fs sampled_at=%.3f history_len=%s latest_camera_ts=[%s,%s,%s]",
                     step,
+                    inference_source,
                     actions.shape,
                     int(parsed["horizon"][0]),
                     float(actions.min()),
                     float(actions.max()),
-                    dt,
+                    infer_result.duration_s,
+                    prepared.observation_sample_interval,
+                    prepared.observation_history_span,
+                    prepared.observation_consumed_interval,
+                    prepared.latest_sampled_at,
+                    observation_history,
+                    latest_sample.head_ts,
+                    latest_sample.left_ts,
+                    latest_sample.right_ts,
                 )
 
                 logging.info(
@@ -631,54 +1156,136 @@ def run_client(
                 )
                 logging.info(
                     "Arm state sdk_first7[:3]=%s sdk_last7[:3]=%s | raw_policy_left[:3]=%s raw_policy_right[:3]=%s | obs_policy_left[:3]=%s obs_policy_right[:3]=%s | gripper_sdk=%s gripper_obs=%s",
-                    np.round(arm_pos_sdk[:7], 4).tolist(),
-                    np.round(arm_pos_sdk[7:], 4).tolist(),
-                    np.round(arm_pos_policy[:7], 4).tolist(),
-                    np.round(arm_pos_policy[7:], 4).tolist(),
-                    np.round(obs_arm_policy[:7], 4).tolist(),
-                    np.round(obs_arm_policy[7:], 4).tolist(),
-                    np.round(gripper_pos_sdk, 4).tolist(),
-                    np.round(obs_gripper_policy, 4).tolist(),
+                    np.round(prepared.arm_pos_sdk[:7], 4).tolist(),
+                    np.round(prepared.arm_pos_sdk[7:], 4).tolist(),
+                    np.round(prepared.arm_pos_policy[:7], 4).tolist(),
+                    np.round(prepared.arm_pos_policy[7:], 4).tolist(),
+                    np.round(prepared.obs_arm_policy[:7], 4).tolist(),
+                    np.round(prepared.obs_arm_policy[7:], 4).tolist(),
+                    np.round(prepared.gripper_pos_sdk, 4).tolist(),
+                    np.round(prepared.obs_gripper_policy, 4).tolist(),
                 )
 
                 if keyboard_monitor.consume_stop_request():
                     logging.info("Stop hotkey received after inference. Exiting before action execution.")
                     break
 
+                speculative_request: InferenceRequest | None = None
+                speculative_evaluation: dict[str, object] | None = None
+
                 action_record: dict[str, object] = {
                     "step": step,
                     "session_id": session_id,
                     "prompt": prompt,
-                    "dt_seconds": round(dt, 6),
+                    "inference_source": inference_source,
+                    "dt_seconds": round(infer_result.duration_s, 6),
+                    "observation_fps_target": float(observation_fps),
+                    "observation_history_frames": int(observation_history),
+                    "observation_interval_target_seconds": round(observation_interval_s, 6),
+                    "observation_sampled_at_seconds": round(prepared.latest_sampled_at, 6),
+                    "observation_interval_seconds": round(prepared.observation_sample_interval, 6),
+                    "observation_history_span_seconds": round(prepared.observation_history_span, 6),
+                    "observation_consumed_interval_seconds": round(prepared.observation_consumed_interval, 6),
+                    "observation_head_camera_timestamp": latest_sample.head_ts,
+                    "observation_left_camera_timestamp": latest_sample.left_ts,
+                    "observation_right_camera_timestamp": latest_sample.right_ts,
+                    "observation_history_sampled_at_seconds": [round(sample.sampled_at, 6) for sample in prepared.sequence],
+                    "observation_history_head_camera_timestamps": [int(sample.head_ts) for sample in prepared.sequence],
+                    "observation_history_left_camera_timestamps": [int(sample.left_ts) for sample in prepared.sequence],
+                    "observation_history_right_camera_timestamps": [int(sample.right_ts) for sample in prepared.sequence],
                     "shape": list(actions.shape),
                     "sdk_observation_arm_order": sdk_arm_order,
                     "sdk_execution_arm_order": sdk_arm_order,
                     "apply_actions": bool(apply_actions),
+                    "speculative_enabled": bool(speculative_config.enabled),
                     "obs_flip_left_joint_indices": list(obs_flip_config.left_joint_indices),
                     "obs_flip_right_joint_indices": list(obs_flip_config.right_joint_indices),
-                    "raw_sdk_arm_joint_states": arm_pos_sdk.tolist(),
-                    "raw_gripper_sdk_states": gripper_pos_sdk.tolist(),
-                    "policy_left_arm_joint_position": arm_pos_policy[:7].tolist(),
-                    "policy_right_arm_joint_position": arm_pos_policy[7:].tolist(),
-                    "obs_left_arm_joint_position": obs_arm_policy[:7].tolist(),
-                    "obs_right_arm_joint_position": obs_arm_policy[7:].tolist(),
-                    "obs_gripper_policy_position": obs_gripper_policy.tolist(),
+                    "raw_sdk_arm_joint_states": prepared.arm_pos_sdk.tolist(),
+                    "raw_waist_joint_states": prepared.waist_pos.tolist(),
+                    "raw_head_joint_states": prepared.head_pos.tolist(),
+                    "raw_gripper_sdk_states": prepared.gripper_pos_sdk.tolist(),
+                    "policy_left_arm_joint_position": prepared.arm_pos_policy[:7].tolist(),
+                    "policy_right_arm_joint_position": prepared.arm_pos_policy[7:].tolist(),
+                    "obs_left_arm_joint_position": prepared.obs_arm_policy[:7].tolist(),
+                    "obs_right_arm_joint_position": prepared.obs_arm_policy[7:].tolist(),
+                    "obs_gripper_policy_position": prepared.obs_gripper_policy.tolist(),
                     "predicted_first_left_arm_joint_position": parsed["left_arm"].tolist(),
                     "predicted_first_right_arm_joint_position": parsed["right_arm"].tolist(),
+                    "predicted_first_waist_position": parsed["waist"].tolist(),
+                    "predicted_first_wheel_command": parsed["wheel"].tolist(),
                     "predicted_first_gripper_position": gripper_plan["first_policy"].tolist(),
                     "predicted_last_gripper_position": gripper_plan["last_policy"].tolist(),
+                    "predicted_last_waist_position": np.asarray(actions[-1][18:20], dtype=np.float32).tolist(),
+                    "predicted_last_wheel_command": np.asarray(actions[-1][20:22], dtype=np.float32).tolist(),
                     "executed_gripper_command_policy": gripper_plan["command_policy"].tolist(),
+                    "speculative_prefetch_submitted": False,
+                    "speculative_prefetch_result_ready_at_boundary": False,
+                    "speculative_prefetch_accepted": False,
+                    "speculative_prefetch_reject_reason": "",
                     "actions": actions.tolist(),
                 }
 
                 if apply_actions:
+                    def _maybe_submit_speculative(row_done: int, row_total: int) -> None:
+                        nonlocal speculative_request
+                        if not speculative_config.enabled or speculative_request is not None:
+                            return
+                        try:
+                            speculative_prepared = _capture_prepared_observation(
+                                step=step + 1,
+                                mode="speculative",
+                                sampler=sampler,
+                                robot=robot,
+                                observation_history=observation_history,
+                                previous_latest_sampled_at=prepared.latest_sampled_at,
+                                prompt=prompt,
+                                session_id=session_id,
+                                sdk_arm_order=sdk_arm_order,
+                                obs_flip_config=obs_flip_config,
+                            )
+                        except Exception as exc:
+                            logging.warning("Failed to capture speculative observation at row %s/%s: %s", row_done, row_total, exc)
+                            return
+
+                        speculative_request = worker.submit(speculative_prepared)
+                        if speculative_request is None:
+                            logging.info("Speculative prefetch skipped at row %s/%s because inference worker is busy.", row_done, row_total)
+                            return
+
+                        action_record["speculative_prefetch_submitted"] = True
+                        action_record["speculative_prefetch_request_id"] = speculative_request.request_id
+                        action_record["speculative_prefetch_row_done"] = row_done
+                        action_record["speculative_prefetch_row_total"] = row_total
+                        action_record["speculative_prefetch_sampled_at_seconds"] = round(
+                            speculative_prepared.latest_sampled_at, 6
+                        )
+                        action_record["speculative_prefetch_capture_time_seconds"] = round(
+                            speculative_prepared.captured_at, 6
+                        )
+                        action_record["speculative_prefetch_observation_interval_seconds"] = round(
+                            speculative_prepared.observation_sample_interval, 6
+                        )
+                        action_record["speculative_prefetch_observation_history_span_seconds"] = round(
+                            speculative_prepared.observation_history_span, 6
+                        )
+                        logging.info(
+                            "Submitted speculative prefetch for step %s at row %s/%s sampled_at=%.3f",
+                            step + 1,
+                            row_done,
+                            row_total,
+                            speculative_prepared.latest_sampled_at,
+                        )
+
                     try:
                         trajectory = _execute_arm_trajectory(
                             robot=robot,
                             actions=actions,
                             limits=limits,
                             sdk_arm_order=sdk_arm_order,
+                            enable_wheel=enable_wheel,
                             should_stop=keyboard_monitor.consume_stop_request,
+                            on_row_complete=_maybe_submit_speculative if speculative_config.enabled else None,
+                            prefetch_fraction=speculative_config.prefetch_fraction,
                         )
                     except _StopRequested:
                         logging.info("Stop hotkey received during move_arm trajectory execution. Exiting immediately.")
@@ -691,9 +1298,11 @@ def run_client(
                         enable_gripper=enable_gripper,
                     )
                     logging.info(
-                        "Executed move_arm dual-arm trajectory | target_rows=%s move_arm_points=%s cur_left[:3]=%s cur_right[:3]=%s first_left[:3]=%s first_right[:3]=%s last_left[:3]=%s last_right[:3]=%s grip=%s head=%s waist=%s wheel(pred only)=%s",
+                        "Executed move_arm dual-arm trajectory | target_rows=%s move_arm_points=%s waist_rows=%s wheel_rows=%s cur_left[:3]=%s cur_right[:3]=%s first_left[:3]=%s first_right[:3]=%s last_left[:3]=%s last_right[:3]=%s grip=%s head=%s waist_first=%s waist_last=%s wheel_first=%s wheel_last=%s",
                         int(trajectory["target_rows"][0]),
                         int(trajectory["move_arm_points"][0]),
+                        int(trajectory["waist_rows_sent"][0]),
+                        int(trajectory["wheel_rows_sent"][0]),
                         np.round(trajectory["arm_cur_policy"][:3], 4).tolist(),
                         np.round(trajectory["arm_cur_policy"][7:10], 4).tolist(),
                         np.round(trajectory["first_arm_policy"][:3], 4).tolist(),
@@ -702,31 +1311,100 @@ def run_client(
                         np.round(trajectory["last_arm_policy"][7:10], 4).tolist(),
                         np.round(aux["gripper"], 4).tolist(),
                         np.round(aux["head"], 4).tolist(),
-                        np.round(aux["waist"], 4).tolist(),
-                        np.round(aux["wheel"], 4).tolist(),
+                        np.round(trajectory["first_waist_sent"], 4).tolist(),
+                        np.round(trajectory["last_waist_sent"], 4).tolist(),
+                        np.round(trajectory["first_wheel_sent"], 4).tolist(),
+                        np.round(trajectory["last_wheel_sent"], 4).tolist(),
                     )
                     logging.info(
-                        "Post-trajectory arm state | left[:3]=%s right[:3]=%s delta_from_pre_left[:3]=%s delta_from_pre_right[:3]=%s arm_error_to_target=%.4f left_error=%.4f right_error=%.4f reached=%s",
+                        "Post-trajectory state | left[:3]=%s right[:3]=%s delta_from_pre_left[:3]=%s delta_from_pre_right[:3]=%s waist=%s arm_error_to_target=%.4f left_error=%.4f right_error=%.4f reached=%s",
                         np.round(trajectory["arm_after_policy"][:3], 4).tolist(),
                         np.round(trajectory["arm_after_policy"][7:10], 4).tolist(),
                         np.round((trajectory["arm_after_policy"] - trajectory["arm_cur_policy"])[:3], 4).tolist(),
                         np.round((trajectory["arm_after_policy"] - trajectory["arm_cur_policy"])[7:10], 4).tolist(),
+                        np.round(trajectory["waist_after"], 4).tolist(),
                         float(trajectory["arm_error"]),
                         float(trajectory["left_error"]),
                         float(trajectory["right_error"]),
                         bool(trajectory["reached"]),
                     )
+
+                    if speculative_request is not None:
+                        speculative_result = worker.wait_for_result(
+                            speculative_request.request_id,
+                            timeout_s=speculative_config.max_boundary_wait_s,
+                        )
+                        if speculative_result is not None:
+                            action_record["speculative_prefetch_result_ready_at_boundary"] = True
+                            action_record["speculative_prefetch_infer_dt_seconds"] = round(
+                                speculative_result.duration_s, 6
+                            )
+                            speculative_evaluation = _evaluate_speculative_result(
+                                result=speculative_result,
+                                robot=robot,
+                                sdk_arm_order=sdk_arm_order,
+                                config=speculative_config,
+                            )
+                            action_record["speculative_prefetch_boundary_arm_delta_max"] = round(
+                                float(speculative_evaluation["arm_delta_max"]), 6
+                            )
+                            action_record["speculative_prefetch_boundary_waist_delta_max"] = round(
+                                float(speculative_evaluation["waist_delta_max"]), 6
+                            )
+                            action_record["speculative_prefetch_boundary_head_delta_max"] = round(
+                                float(speculative_evaluation["head_delta_max"]), 6
+                            )
+                            action_record["speculative_prefetch_boundary_gripper_delta_max"] = round(
+                                float(speculative_evaluation["gripper_delta_max"]), 6
+                            )
+                            action_record["speculative_prefetch_state_age_seconds"] = round(
+                                float(speculative_evaluation["state_age_s"]), 6
+                            )
+                            action_record["speculative_prefetch_accepted"] = bool(
+                                speculative_evaluation["accepted"]
+                            )
+                            action_record["speculative_prefetch_reject_reason"] = str(
+                                speculative_evaluation["reason"]
+                            )
+                            if bool(speculative_evaluation["accepted"]):
+                                prefetched_result = speculative_result
+                                logging.info(
+                                    "Accepted speculative result for next step | arm_delta=%.4f waist_delta=%.4f age=%.3fs infer_dt=%.3fs",
+                                    float(speculative_evaluation["arm_delta_max"]),
+                                    float(speculative_evaluation["waist_delta_max"]),
+                                    float(speculative_evaluation["state_age_s"]),
+                                    float(speculative_result.duration_s),
+                                )
+                            else:
+                                logging.info(
+                                    "Rejected speculative result | reason=%s head_delta=%.4f gripper_delta=%.4f",
+                                    speculative_evaluation["reason"],
+                                    float(speculative_evaluation["head_delta_max"]),
+                                    float(speculative_evaluation["gripper_delta_max"]),
+                                )
+                        else:
+                            action_record["speculative_prefetch_reject_reason"] = "result_not_ready_at_boundary"
+                            worker.forget_request(speculative_request.request_id)
+                            logging.info("Speculative result not ready at boundary; next step will fall back to sync inference.")
+
                     action_record.update(
                         {
-                            "execution_mode": "move_arm_ruckig_dual_arm",
+                            "execution_mode": "move_arm_ruckig_with_waist_stream",
                             "trajectory_rows": int(trajectory["target_rows"][0]),
                             "move_arm_points": int(trajectory["move_arm_points"][0]),
+                            "trajectory_waist_rows_sent": int(trajectory["waist_rows_sent"][0]),
+                            "trajectory_wheel_rows_sent": int(trajectory["wheel_rows_sent"][0]),
                             "trajectory_first_left_arm_joint_position": trajectory["first_arm_policy"][:7].tolist(),
                             "trajectory_first_right_arm_joint_position": trajectory["first_arm_policy"][7:14].tolist(),
                             "trajectory_last_left_arm_joint_position": trajectory["last_arm_policy"][:7].tolist(),
                             "trajectory_last_right_arm_joint_position": trajectory["last_arm_policy"][7:14].tolist(),
+                            "trajectory_first_waist_position": trajectory["first_waist_sent"].tolist(),
+                            "trajectory_last_waist_position": trajectory["last_waist_sent"].tolist(),
+                            "trajectory_first_wheel_command": trajectory["first_wheel_sent"].tolist(),
+                            "trajectory_last_wheel_command": trajectory["last_wheel_sent"].tolist(),
                             "post_left_arm_joint_position": trajectory["arm_after_policy"][:7].tolist(),
                             "post_right_arm_joint_position": trajectory["arm_after_policy"][7:14].tolist(),
+                            "post_waist_position": trajectory["waist_after"].tolist(),
                             "post_arm_error_to_target": round(float(trajectory["arm_error"]), 6),
                             "post_left_arm_error_to_target": round(float(trajectory["left_error"]), 6),
                             "post_right_arm_error_to_target": round(float(trajectory["right_error"]), 6),
@@ -744,6 +1422,20 @@ def run_client(
 
                 step += 1
     finally:
+        try:
+            logging.info("Stopping inference worker...")
+            worker.stop()
+            logging.info("Inference worker stopped.")
+        except Exception as exc:
+            logging.warning("Failed while stopping inference worker: %s", exc)
+
+        try:
+            logging.info("Stopping observation sampler...")
+            sampler.stop()
+            logging.info("Observation sampler stopped.")
+        except Exception as exc:
+            logging.warning("Failed while stopping observation sampler: %s", exc)
+
         try:
             if hasattr(client, "_ws") and client._ws is not None:
                 logging.info("Closing websocket connection...")
@@ -772,6 +1464,53 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9443)
     parser.add_argument("--prompt", default="Pick up the object")
+    parser.add_argument(
+        "--observation-fps",
+        type=float,
+        default=5.0,
+        help="Fixed camera observation sampling rate used for model inputs.",
+    )
+    parser.add_argument(
+        "--observation-history",
+        type=int,
+        default=4,
+        help="Number of most recent real camera samples to stack into each observation.",
+    )
+    parser.add_argument(
+        "--enable-speculative-inference",
+        action="store_true",
+        help="Run next-step inference in the background during current chunk execution and only accept it at the chunk boundary if the robot state is still close.",
+    )
+    parser.add_argument(
+        "--speculative-prefetch-fraction",
+        type=float,
+        default=0.7,
+        help="Fraction of the current chunk completed before submitting speculative next-step inference.",
+    )
+    parser.add_argument(
+        "--speculative-max-boundary-wait",
+        type=float,
+        default=0.15,
+        help="How long to wait at the chunk boundary for a speculative inference result before falling back to sync inference.",
+    )
+    parser.add_argument(
+        "--speculative-max-state-age",
+        type=float,
+        default=1.5,
+        help="Reject speculative results whose observation snapshot is older than this many seconds at the chunk boundary.",
+    )
+    parser.add_argument(
+        "--speculative-arm-state-tolerance",
+        type=float,
+        default=0.12,
+        help="Max allowed arm-state drift between speculative snapshot and chunk boundary.",
+    )
+    parser.add_argument(
+        "--speculative-waist-state-tolerance",
+        type=float,
+        default=0.03,
+        help="Max allowed waist-state drift between speculative snapshot and chunk boundary.",
+    )
     parser.add_argument("--apply-actions", action="store_true", help="Enable sending actions to robot")
     parser.add_argument("--disable-gripper", action="store_true", help="Do not send gripper commands during execution")
     parser.add_argument("--gripper-close-threshold", type=float, default=0.5)
@@ -784,6 +1523,21 @@ def main() -> None:
     parser.add_argument("--head-delta-limit", type=float, default=0.15)
     parser.add_argument("--waist-pitch-delta-limit", type=float, default=0.10)
     parser.add_argument("--waist-lift-delta-limit", type=float, default=2.0)
+    parser.add_argument("--apply-wheel-actions", action="store_true", help="Enable streaming move_wheel commands from model output")
+    parser.add_argument("--linear-velocity-limit", type=float, default=0.15)
+    parser.add_argument("--angular-velocity-limit", type=float, default=0.40)
+    parser.add_argument(
+        "--arm-trajectory-interval",
+        type=float,
+        default=DEFAULT_MOVE_ARM_INTERVAL_S,
+        help="Seconds between streamed move_arm trajectory points. Lower is faster but more aggressive.",
+    )
+    parser.add_argument(
+        "--arm-close-timeout",
+        type=float,
+        default=DEFAULT_MOVE_ARM_TIMEOUT_S,
+        help="Max seconds to wait after sending the arm trajectory before starting next inference. Set lower to speed up.",
+    )
     parser.add_argument(
         "--sdk-arm-order",
         choices=["left_right", "right_left"],
@@ -808,6 +1562,10 @@ def main() -> None:
         head_delta=args.head_delta_limit,
         waist_pitch_delta=args.waist_pitch_delta_limit,
         waist_lift_delta=args.waist_lift_delta_limit,
+        linear_velocity=args.linear_velocity_limit,
+        angular_velocity=args.angular_velocity_limit,
+        arm_trajectory_interval=args.arm_trajectory_interval,
+        arm_close_timeout=args.arm_close_timeout,
     )
 
     run_client(
@@ -816,6 +1574,7 @@ def main() -> None:
         prompt=args.prompt,
         apply_actions=args.apply_actions,
         enable_gripper=not args.disable_gripper,
+        enable_wheel=args.apply_wheel_actions,
         limits=limits,
         sdk_arm_order=args.sdk_arm_order,
         obs_flip_config=ObsFlipConfig(
@@ -825,6 +1584,16 @@ def main() -> None:
         gripper_config=GripperConfig(
             close_threshold=args.gripper_close_threshold,
             close_when_high=not args.gripper_close_when_low,
+        ),
+        observation_fps=args.observation_fps,
+        observation_history=args.observation_history,
+        speculative_config=SpeculativeConfig(
+            enabled=args.enable_speculative_inference,
+            prefetch_fraction=args.speculative_prefetch_fraction,
+            max_boundary_wait_s=args.speculative_max_boundary_wait,
+            max_state_age_s=args.speculative_max_state_age,
+            arm_state_tolerance=args.speculative_arm_state_tolerance,
+            waist_state_tolerance=args.speculative_waist_state_tolerance,
         ),
     )
 
