@@ -31,15 +31,33 @@ from eval_utils.policy_server import PolicyServerConfig
 
 logger = logging.getLogger(__name__)
 
+SIGNAL_INFER = 0
+SIGNAL_SHUTDOWN = 1
+SIGNAL_IDLE = 2
+SIGNAL_RESET_CACHE = 3
+
+
+def _reset_policy_inference_cache(policy: object, reason: str) -> None:
+    trained_model = getattr(policy, "trained_model", None)
+    action_head = getattr(trained_model, "action_head", None)
+    reset_fn = getattr(action_head, "reset_inference_cache", None)
+    if callable(reset_fn):
+        reset_fn()
+        logger.info("Reset action-head inference cache on rank %s (%s)", dist.get_rank() if dist.is_initialized() else "?", reason)
+    else:
+        logger.warning("Policy action head does not expose reset_inference_cache(); cache reset skipped (%s)", reason)
+
 @dataclasses.dataclass
 class Args:
     port: int = 8000
     timeout_seconds: int = 50000  # 10 hours default, configurable
     model_path: str = "./checkpoints/dreamzero"
-    enable_dit_cache: bool = False
+    enable_dit_cache: bool = False  # Backward-compatible alias for num_dit_steps=8.
+    num_dit_steps: int | None = None  # Actual DiT compute steps. Supported fast masks: 5, 6, 7, 8. None keeps model default.
     index: int = 0
     embodiment_tag: str = "oxe_droid"
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
+    video_save_mode: str = "first"  # one of: none, first, full. Controls generated video saved on reset/client close.
 
 
 class DistributedRoboarenaPolicyBase:
@@ -50,10 +68,12 @@ class DistributedRoboarenaPolicyBase:
         groot_policy: GrootSimPolicy,
         signal_group: dist.ProcessGroup,
         output_dir: str | None = None,
+        video_save_mode: str = "first",
     ) -> None:
         self._policy = groot_policy
         self._signal_group = signal_group
         self._output_dir = output_dir
+        self._video_save_mode = video_save_mode
         self._frame_buffers = self._init_frame_buffers()
         self._current_session_id: str | None = None
         self.video_across_time = []
@@ -71,7 +91,9 @@ class DistributedRoboarenaPolicyBase:
     def _after_infer(self) -> None:
         pass
 
-    def _prepare_video_chunk(self, video_pred: torch.Tensor) -> torch.Tensor:
+    def _prepare_video_chunk(self, video_pred: torch.Tensor) -> torch.Tensor | None:
+        if self._video_save_mode == "none":
+            return None
         return video_pred
 
     def _video_save_fps(self) -> int:
@@ -102,11 +124,16 @@ class DistributedRoboarenaPolicyBase:
                 action_dict[key] = getattr(action_chunk_dict, key)
         return action_dict
 
+    def _broadcast_signal_to_workers(self, signal: int) -> None:
+        signal_tensor = torch.tensor([signal], dtype=torch.int32, device='cpu')
+        dist.broadcast(signal_tensor, src=0, group=self._signal_group)
+
     def infer(self, obs: dict) -> np.ndarray:
         session_id = obs.get('session_id')
         if session_id is not None and session_id != self._current_session_id:
             if self._current_session_id is not None:
                 logger.info("Session changed from '%s' to '%s', resetting state", self._current_session_id, session_id)
+                self._broadcast_signal_to_workers(SIGNAL_RESET_CACHE)
                 self._reset_state()
             else:
                 logger.info("New session started: '%s'", session_id)
@@ -115,8 +142,7 @@ class DistributedRoboarenaPolicyBase:
         self._msg_index += 1
         converted_obs = self._convert_observation(obs)
 
-        signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
-        dist.broadcast(signal_tensor, src=0, group=self._signal_group)
+        self._broadcast_signal_to_workers(SIGNAL_INFER)
         self._broadcast_batch_to_workers(converted_obs)
 
         batch = Batch(obs=converted_obs)
@@ -125,7 +151,9 @@ class DistributedRoboarenaPolicyBase:
             result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
         dist.barrier()
 
-        self.video_across_time.append(self._prepare_video_chunk(video_pred))
+        video_chunk = self._prepare_video_chunk(video_pred)
+        if video_chunk is not None:
+            self.video_across_time.append(video_chunk.detach().cpu())
         action = self._convert_action(self._extract_action_dict(result_batch.act))
         self._after_infer()
         return action
@@ -134,12 +162,16 @@ class DistributedRoboarenaPolicyBase:
         if save_video and len(self.video_across_time) > 0 and self._output_dir:
             try:
                 frame_list = []
-                video_across_time_cat = torch.cat(self.video_across_time, dim=2)
-                frames = self._policy.trained_model.action_head.vae.decode(
+                action_head = self._policy.trained_model.action_head
+                device = getattr(action_head, "_device", None)
+                if device is None:
+                    device = next(self._policy.trained_model.parameters()).device
+                video_across_time_cat = torch.cat(self.video_across_time, dim=2).to(device=device, dtype=torch.bfloat16)
+                frames = action_head.vae.decode(
                     video_across_time_cat,
-                    tiled=self._policy.trained_model.action_head.tiled,
-                    tile_size=(self._policy.trained_model.action_head.tile_size_height, self._policy.trained_model.action_head.tile_size_width),
-                    tile_stride=(self._policy.trained_model.action_head.tile_stride_height, self._policy.trained_model.action_head.tile_stride_width),
+                    tiled=action_head.tiled,
+                    tile_size=(action_head.tile_size_height, action_head.tile_size_width),
+                    tile_stride=(action_head.tile_stride_height, action_head.tile_stride_width),
                 )
                 frames = rearrange(frames, 'B C T H W -> B T H W C')
                 frames = frames[0]
@@ -153,9 +185,9 @@ class DistributedRoboarenaPolicyBase:
                         save_dir = self._output_dir
                         os.makedirs(save_dir, exist_ok=True)
                         all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith('.mp4')]
-                        timestamp = datetime.datetime.now().strftime('%m_%d_%H_%M_%S')
+                        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
                         num_frames = len(frame_list)
-                        output_path = os.path.join(save_dir, f'{len(all_mp4_files):06}_{timestamp}_f{num_frames}.mp4')
+                        output_path = os.path.join(save_dir, f'{timestamp}_{len(all_mp4_files):06}_f{num_frames}.mp4')
                         imageio.mimsave(output_path, frame_list, fps=self._video_save_fps(), codec='libx264')
                         logger.info('Saved video on reset to: %s', output_path)
             except Exception as exc:
@@ -165,9 +197,11 @@ class DistributedRoboarenaPolicyBase:
             self._frame_buffers[key] = []
 
         self.video_across_time = []
+        _reset_policy_inference_cache(self._policy, "wrapper reset_state")
         self._reset_custom_state()
 
     def reset(self, reset_info: dict) -> None:
+        self._broadcast_signal_to_workers(SIGNAL_RESET_CACHE)
         self._reset_state(save_video=True)
 
 
@@ -181,8 +215,14 @@ class ARDroidRoboarenaPolicy(DistributedRoboarenaPolicyBase):
         groot_policy: GrootSimPolicy,
         signal_group: dist.ProcessGroup,
         output_dir: str | None = None,
+        video_save_mode: str = "first",
     ) -> None:
-        super().__init__(groot_policy=groot_policy, signal_group=signal_group, output_dir=output_dir)
+        super().__init__(
+            groot_policy=groot_policy,
+            signal_group=signal_group,
+            output_dir=output_dir,
+            video_save_mode=video_save_mode,
+        )
         self._reset_custom_state()
 
     def _init_frame_buffers(self) -> dict[str, list[np.ndarray]]:
@@ -293,8 +333,14 @@ class AgiBotRoboarenaPolicy(DistributedRoboarenaPolicyBase):
         groot_policy: GrootSimPolicy,
         signal_group: dist.ProcessGroup,
         output_dir: str | None = None,
+        video_save_mode: str = "first",
     ) -> None:
-        super().__init__(groot_policy=groot_policy, signal_group=signal_group, output_dir=output_dir)
+        super().__init__(
+            groot_policy=groot_policy,
+            signal_group=signal_group,
+            output_dir=output_dir,
+            video_save_mode=video_save_mode,
+        )
         self._action_keys = list(self._policy.modality_configs.action.modality_keys)
 
     def _lookup_obs_value(self, obs: dict, source_key: str, target_key: str) -> object:
@@ -320,10 +366,16 @@ class AgiBotRoboarenaPolicy(DistributedRoboarenaPolicyBase):
             return array.astype(np.float64)
         raise ValueError(f'AgiBot state input for {target_key} must be 1D or 2D, got {array.shape}')
 
-    def _prepare_video_chunk(self, video_pred: torch.Tensor) -> torch.Tensor:
+    def _prepare_video_chunk(self, video_pred: torch.Tensor) -> torch.Tensor | None:
+        if self._video_save_mode == "none":
+            return None
         if video_pred.ndim != 5:
             raise ValueError(f'AgiBot video prediction must be 5D (B, C, T, H, W), got {tuple(video_pred.shape)}')
-        return video_pred[:, :, :1].contiguous()
+        if self._video_save_mode == "first":
+            return video_pred[:, :, :1].contiguous()
+        if self._video_save_mode == "full":
+            return video_pred.contiguous()
+        raise ValueError(f"Unsupported video_save_mode: {self._video_save_mode!r}; expected none, first, or full")
 
     def _video_save_fps(self) -> int:
         return 20
@@ -438,11 +490,15 @@ class WebsocketPolicyServer:
                 dist.broadcast(signal_tensor, src=0, group=self._signal_group)
 
                 signal = signal_tensor.item()
-                if signal == 1:
+                if signal == SIGNAL_SHUTDOWN:
                     logger.info(f"Rank {dist.get_rank()} received shutdown signal")
                     break
-                elif signal == 2:
+                elif signal == SIGNAL_IDLE:
                     logger.info(f"Rank {dist.get_rank()} received idle signal. Waiting for next client.")
+                    continue
+                elif signal == SIGNAL_RESET_CACHE:
+                    logger.info(f"Rank {dist.get_rank()} received inference cache reset signal")
+                    _reset_policy_inference_cache(self._policy, "worker signal")
                     continue
 
                 batch = self._receive_batch_from_rank0()
@@ -578,11 +634,22 @@ def _create_wrapper_policy(
     groot_policy: GrootSimPolicy,
     signal_group: dist.ProcessGroup,
     output_dir: str | None,
+    video_save_mode: str,
 ) -> DistributedRoboarenaPolicyBase:
     if embodiment_tag == 'oxe_droid':
-        return ARDroidRoboarenaPolicy(groot_policy=groot_policy, signal_group=signal_group, output_dir=output_dir)
+        return ARDroidRoboarenaPolicy(
+            groot_policy=groot_policy,
+            signal_group=signal_group,
+            output_dir=output_dir,
+            video_save_mode=video_save_mode,
+        )
     if embodiment_tag == 'agibot':
-        return AgiBotRoboarenaPolicy(groot_policy=groot_policy, signal_group=signal_group, output_dir=output_dir)
+        return AgiBotRoboarenaPolicy(
+            groot_policy=groot_policy,
+            signal_group=signal_group,
+            output_dir=output_dir,
+            video_save_mode=video_save_mode,
+        )
     raise ValueError(f'Unsupported embodiment_tag: {embodiment_tag}')
 
 
@@ -610,7 +677,13 @@ def _create_server_config(embodiment_tag: str) -> PolicyServerConfig:
 
 def main(args: Args) -> None:
     os.environ["ENABLE_DIT_CACHE"] = "true" if args.enable_dit_cache else "false"
+    if args.num_dit_steps is not None:
+        os.environ["NUM_DIT_STEPS"] = str(args.num_dit_steps)
+    elif args.enable_dit_cache:
+        os.environ.setdefault("NUM_DIT_STEPS", "8")
     os.environ.setdefault("ATTENTION_BACKEND", "FA2")
+    if args.video_save_mode not in {"none", "first", "full"}:
+        raise ValueError(f"--video-save-mode must be one of none, first, full; got {args.video_save_mode!r}")
     torch._dynamo.config.recompile_limit = 800
 
     embodiment_tag = args.embodiment_tag.lower()
@@ -636,16 +709,26 @@ def main(args: Args) -> None:
         device="cuda" if torch.cuda.is_available() else "cpu",
         device_mesh=device_mesh,
     )
+    action_head = policy.trained_model.action_head
+    logging.info(
+        "[CONFIG CHECK] rank=%s action_head.num_inference_steps=%s "
+        "action_head.num_inference_timesteps=%s action_head.num_frame_per_block=%s "
+        "action_head.model.num_frame_per_block=%s NUM_DIT_STEPS=%s ENABLE_DIT_CACHE=%s",
+        rank,
+        getattr(action_head, "num_inference_steps", None),
+        getattr(action_head, "num_inference_timesteps", None),
+        getattr(action_head, "num_frame_per_block", None),
+        getattr(getattr(action_head, "model", None), "num_frame_per_block", None),
+        os.getenv("NUM_DIT_STEPS"),
+        os.getenv("ENABLE_DIT_CACHE"),
+    )
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
 
     if rank == 0:
         logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
-        parent_dir = os.path.dirname(model_path)
-        date_suffix = datetime.datetime.now().strftime("%Y%m%d")
-        checkpoint_name = os.path.basename(model_path)
-        output_dir = os.path.join(parent_dir, f"real_world_eval_gen_{date_suffix}_{args.index}", checkpoint_name)
+        output_dir = "/home/user/wangk/dreamzero/video_rollout"
         os.makedirs(output_dir, exist_ok=True)
         logging.info("Videos will be saved to: %s", output_dir)
     else:
@@ -657,6 +740,7 @@ def main(args: Args) -> None:
         groot_policy=policy,
         signal_group=signal_group,
         output_dir=output_dir,
+        video_save_mode=args.video_save_mode,
     )
 
     server_config = _create_server_config(embodiment_tag)

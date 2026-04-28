@@ -172,7 +172,13 @@ class WANPolicyHead(ActionHead):
         self.scheduler = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
         self.model_names = ['text_encoder']
 
-        self.num_inference_steps = 16 
+        self.num_inference_steps = (
+            int(config.num_inference_timesteps)
+            if config.num_inference_timesteps is not None
+            else 16
+        )
+        if self.num_inference_steps <= 0:
+            raise ValueError(f"num_inference_timesteps must be positive, got {self.num_inference_steps}")
         self.seed = 1140
         self.cfg_scale = 5.0
         self.denoising_strength = 1.0
@@ -310,6 +316,16 @@ class WANPolicyHead(ActionHead):
         self.defer_lora_injection = config.defer_lora_injection
         print("defer_lora_injection@@", self.defer_lora_injection)
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
+
+    def reset_inference_cache(self) -> None:
+        self.kv_cache1 = None
+        self.kv_cache_neg = None
+        self.crossattn_cache = None
+        self.crossattn_cache_neg = None
+        self.clip_feas = None
+        self.ys = None
+        self.current_start_frame = 0
+        self.language = None
 
     def set_trainable_parameters(self, tune_projector: bool, tune_diffusion_model: bool):
         self.tune_projector = tune_projector
@@ -897,6 +913,9 @@ class WANPolicyHead(ActionHead):
         return cast(list[tuple[torch.Tensor, torch.Tensor]], output_predictions)
     
     def should_run_model(self, index, current_timestep, prev_predictions):
+
+        if self.num_inference_steps <= 4:
+            return True
 
         if not self.dynamic_cache_schedule:
             return self.dit_step_mask[index]

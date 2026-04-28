@@ -52,6 +52,8 @@ def _wait_for_image(camera: Camera, name: str, timeout_s: float = 2.0) -> Tuple[
 
 
 ArmOrder = Literal["left_right", "right_left"]
+ArmExecutionMode = Literal["ruckig", "direct-48"]
+ActionSmoothingMode = Literal["none", "savgol"]
 DEFAULT_SDK_ARM_ORDER: ArmOrder = "left_right"
 ARM_JOINT_COUNT = 14
 RIGHT_ARM_START = 7
@@ -62,6 +64,8 @@ RUCKIG_MAX_VELOCITY = 2.0
 RUCKIG_MAX_ACCELERATION = 1.0
 RUCKIG_MAX_JERK = 5.0
 GRIPPER_OBSERVATION_MAX = 120.0
+DEGREE_LIKE_THRESHOLD = float(2.0 * np.pi)
+WAIST_LIFT_M_TO_CM = 100.0
 
 
 class _StopRequested(Exception):
@@ -409,6 +413,23 @@ def _policy_to_sdk_arm(policy_arm: np.ndarray, sdk_arm_order: ArmOrder) -> np.nd
     raise ValueError(f"Unsupported sdk_arm_order: {sdk_arm_order}")
 
 
+def _angles_to_policy_radians(values: list | np.ndarray) -> np.ndarray:
+    """Normalize GDK joint angles to the training-time radian scale."""
+    arr = np.asarray(values, dtype=np.float32)
+    if np.any(np.abs(arr) > DEGREE_LIKE_THRESHOLD):
+        arr = np.deg2rad(arr).astype(np.float32)
+    return arr
+
+
+def _policy_waist_to_sdk(values: list | np.ndarray) -> np.ndarray:
+    """Convert policy waist [pitch(rad), lift(m)] to GDK move_waist [pitch(rad), lift(cm)]."""
+    waist = np.asarray(values, dtype=np.float32).copy()
+    if waist.shape[0] != 2:
+        raise ValueError(f"waist command length must be 2, got {waist.shape[0]}")
+    waist[1] *= WAIST_LIFT_M_TO_CM
+    return waist
+
+
 def _sdk_gripper_to_policy(values: list | np.ndarray) -> np.ndarray:
     """Map GDK gripper states to policy order [left, right].
 
@@ -422,10 +443,14 @@ def _sdk_gripper_to_policy(values: list | np.ndarray) -> np.ndarray:
 
 
 def _sdk_gripper_to_policy_obs(values: list | np.ndarray) -> np.ndarray:
-    """Map GDK gripper states [0, 1] to the training-time observation scale [0, 120]."""
+    """Map GDK gripper states to the training-time observation scale [0, 120].
+
+    GDK gripper_states() already reports the physical gripper scale used by
+    training logs: near 0 when open and near 120 when closed. Do not treat
+    small open-state jitter such as 0.217 as a normalized [0, 1] value.
+    """
     pair = _sdk_gripper_to_policy(values)
-    pair = np.clip(pair, 0.0, 1.0)
-    return (pair * GRIPPER_OBSERVATION_MAX).astype(np.float32)
+    return np.clip(pair, 0.0, GRIPPER_OBSERVATION_MAX).astype(np.float32)
 
 
 def _policy_gripper_to_sdk(values: list | np.ndarray) -> np.ndarray:
@@ -467,7 +492,7 @@ def _build_obs(
     obs["observation/right_effector_position"] = np.asarray([gripper_pos_policy[1]], dtype=np.float32)
 
     # Head and waist states
-    head_pos = np.asarray(head_pos, dtype=np.float32)
+    head_pos = _angles_to_policy_radians(head_pos)
     waist_pos = np.asarray(waist_pos, dtype=np.float32)
     if head_pos.shape[0] != 2:
         raise ValueError(f"head_joint_states length must be 2, got {head_pos.shape[0]}")
@@ -492,6 +517,7 @@ class Limits:
     angular_velocity: float
     arm_trajectory_interval: float
     arm_close_timeout: float
+    direct_control_hz: float
 
 
 @dataclass(frozen=True)
@@ -506,6 +532,14 @@ class GripperConfig:
 class ObsFlipConfig:
     left_joint_indices: tuple[int, ...] = ()
     right_joint_indices: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class ActionSmoothingConfig:
+    mode: ActionSmoothingMode = "none"
+    window: int = 7
+    polyorder: int = 2
+    upsample: int = 2
 
 
 def _parse_joint_index_list(raw: str) -> tuple[int, ...]:
@@ -753,6 +787,128 @@ def _select_gripper_command(actions: np.ndarray, gripper_config: GripperConfig) 
     }
 
 
+def _gripper_policy_to_command(policy_values: np.ndarray, gripper_config: GripperConfig) -> np.ndarray:
+    pair = np.asarray(policy_values, dtype=np.float32).reshape(-1)
+    if pair.shape[0] != 2:
+        raise ValueError(f"Expected gripper pair with 2 dims, got {pair.shape[0]}")
+    if gripper_config.close_when_high:
+        close_mask = pair >= gripper_config.close_threshold
+    else:
+        close_mask = pair <= gripper_config.close_threshold
+    return np.where(
+        close_mask,
+        gripper_config.closed_value,
+        gripper_config.open_value,
+    ).astype(np.float32)
+
+
+def _savgol_coefficients(window: int, polyorder: int) -> np.ndarray:
+    if window % 2 == 0:
+        raise ValueError(f"savgol window must be odd, got {window}")
+    if window <= polyorder:
+        raise ValueError(f"savgol window must be greater than polyorder, got window={window}, polyorder={polyorder}")
+    half = window // 2
+    x = np.arange(-half, half + 1, dtype=np.float64)
+    design = np.vander(x, polyorder + 1, increasing=True)
+    return np.linalg.pinv(design)[0].astype(np.float64)
+
+
+def _savgol_filter_1d(values: np.ndarray, window: int, polyorder: int) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.shape[0] < 3:
+        return arr.astype(np.float32)
+    window = min(window, arr.shape[0] if arr.shape[0] % 2 == 1 else arr.shape[0] - 1)
+    if window <= polyorder:
+        return arr.astype(np.float32)
+    coeffs = _savgol_coefficients(window, polyorder)
+    half = window // 2
+    padded = np.pad(arr, (half, half), mode="edge")
+    out = np.empty_like(arr)
+    for index in range(arr.shape[0]):
+        out[index] = float(np.dot(coeffs, padded[index:index + window]))
+    return out.astype(np.float32)
+
+
+def _smooth_actions_savgol(actions: np.ndarray, config: ActionSmoothingConfig) -> np.ndarray:
+    arr = np.asarray(actions, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[0] < 3 or arr.shape[1] < ARM_JOINT_COUNT:
+        return arr.copy()
+
+    upsample = max(int(config.upsample), 1)
+    window = int(config.window)
+    if window % 2 == 0:
+        window += 1
+    polyorder = max(int(config.polyorder), 0)
+
+    smoothed = arr.copy()
+    source_t = np.arange(arr.shape[0], dtype=np.float64)
+    if upsample > 1:
+        dense_t = np.linspace(0.0, float(arr.shape[0] - 1), arr.shape[0] * upsample, dtype=np.float64)
+    else:
+        dense_t = source_t
+
+    for dim in range(ARM_JOINT_COUNT):
+        dense_values = np.interp(dense_t, source_t, arr[:, dim].astype(np.float64))
+        filtered_dense = _savgol_filter_1d(dense_values, window=window, polyorder=polyorder)
+        smoothed[:, dim] = np.interp(source_t, dense_t, filtered_dense.astype(np.float64)).astype(np.float32)
+
+    # Preserve chunk endpoints so smoothing does not drift the intended start/end targets.
+    smoothed[0, :ARM_JOINT_COUNT] = arr[0, :ARM_JOINT_COUNT]
+    smoothed[-1, :ARM_JOINT_COUNT] = arr[-1, :ARM_JOINT_COUNT]
+    return smoothed
+
+
+def _maybe_smooth_actions(actions: np.ndarray, config: ActionSmoothingConfig) -> tuple[np.ndarray, float]:
+    started_at = time.time()
+    if config.mode == "none":
+        return np.asarray(actions, dtype=np.float32), 0.0
+    if config.mode == "savgol":
+        smoothed = _smooth_actions_savgol(actions, config)
+        return smoothed, time.time() - started_at
+    raise ValueError(f"Unsupported action smoothing mode: {config.mode}")
+
+
+def _make_row_execution_record(
+    *,
+    row_index: int,
+    total_rows: int,
+    row_started_at: float,
+    execution_started_at: float,
+    safe_policy_target: np.ndarray,
+    row_parts: dict[str, np.ndarray],
+    safe_waist: np.ndarray | None,
+    safe_wheel: np.ndarray | None,
+    row_gripper_policy: np.ndarray,
+    row_gripper_sdk: np.ndarray,
+    arm_points_sent_this_row: int,
+    waist_sent: bool,
+    wheel_sent: bool,
+    gripper_sent: bool,
+) -> dict[str, object]:
+    return {
+        "row_index": int(row_index),
+        "row_total": int(total_rows),
+        "row_started_at_seconds": round(row_started_at, 6),
+        "row_elapsed_from_execution_start_seconds": round(row_started_at - execution_started_at, 6),
+        "arm_points_sent_this_row": int(arm_points_sent_this_row),
+        "safe_left_arm_target": np.asarray(safe_policy_target[:7], dtype=np.float32).tolist(),
+        "safe_right_arm_target": np.asarray(safe_policy_target[7:14], dtype=np.float32).tolist(),
+        "raw_left_arm_target": np.asarray(row_parts["left_arm"], dtype=np.float32).tolist(),
+        "raw_right_arm_target": np.asarray(row_parts["right_arm"], dtype=np.float32).tolist(),
+        "raw_gripper_policy": np.asarray(row_parts["gripper"], dtype=np.float32).tolist(),
+        "gripper_command_policy": np.asarray(row_gripper_policy, dtype=np.float32).tolist(),
+        "gripper_command_sdk": np.asarray(row_gripper_sdk, dtype=np.float32).tolist(),
+        "gripper_sent": bool(gripper_sent),
+        "raw_waist_target": np.asarray(row_parts["waist"], dtype=np.float32).tolist(),
+        "safe_waist_target_policy": [] if safe_waist is None else np.asarray(safe_waist, dtype=np.float32).tolist(),
+        "safe_waist_target_sdk": [] if safe_waist is None else _policy_waist_to_sdk(safe_waist).tolist(),
+        "waist_sent": bool(waist_sent),
+        "raw_wheel_command": np.asarray(row_parts["wheel"], dtype=np.float32).tolist(),
+        "safe_wheel_command": [] if safe_wheel is None else np.asarray(safe_wheel, dtype=np.float32).tolist(),
+        "wheel_sent": bool(wheel_sent),
+    }
+
+
 def _build_safe_arm_targets(
     actions: np.ndarray,
     current_policy_arm: np.ndarray,
@@ -829,6 +985,7 @@ def _wait_arm_close(
     timeout_s: float,
     should_stop: Callable[[], bool],
 ) -> dict[str, np.ndarray | float | bool]:
+    wait_started_at = time.time()
     deadline = time.time() + max(timeout_s, 0.0)
     last_policy_arm = _sdk_to_policy_arm(np.asarray(robot.arm_joint_states()[0], dtype=np.float32), sdk_arm_order)
     reached = False
@@ -845,12 +1002,16 @@ def _wait_arm_close(
             break
         time.sleep(0.1)
 
+    wait_finished_at = time.time()
     return {
         "arm_after_policy": last_policy_arm,
         "arm_error": float(np.max(np.abs(last_policy_arm[:ARM_JOINT_COUNT] - target_policy_arm[:ARM_JOINT_COUNT]))),
         "left_error": float(np.max(np.abs(last_policy_arm[:RIGHT_ARM_START] - target_policy_arm[:RIGHT_ARM_START]))),
         "right_error": float(np.max(np.abs(last_policy_arm[RIGHT_ARM_START:ARM_JOINT_COUNT] - target_policy_arm[RIGHT_ARM_START:ARM_JOINT_COUNT]))),
         "reached": reached,
+        "wait_started_at": wait_started_at,
+        "wait_finished_at": wait_finished_at,
+        "wait_duration_seconds": wait_finished_at - wait_started_at,
     }
 
 
@@ -859,10 +1020,13 @@ def _execute_arm_trajectory(
     actions: np.ndarray,
     limits: Limits,
     sdk_arm_order: ArmOrder,
+    gripper_config: GripperConfig,
+    enable_gripper: bool,
     enable_wheel: bool,
     should_stop: Callable[[], bool],
     on_row_complete: Callable[[int, int], None] | None = None,
     prefetch_fraction: float = 1.0,
+    log_row_execution: bool = False,
 ) -> dict[str, np.ndarray | int | float | bool]:
     arr = np.asarray(actions, dtype=np.float32)
     if arr.ndim != 2 or arr.shape[1] < 22:
@@ -877,17 +1041,33 @@ def _execute_arm_trajectory(
     move_arm_points = 0
     waist_rows_sent = 0
     wheel_rows_sent = 0
+    wheel_stop_sent = False
+    gripper_updates = 0
     first_waist_sent: np.ndarray | None = None
     last_waist_sent: np.ndarray | None = None
     first_wheel_sent: np.ndarray | None = None
     last_wheel_sent: np.ndarray | None = None
+    first_gripper_sent_policy: np.ndarray | None = None
+    last_gripper_sent_policy: np.ndarray | None = None
 
     prev_sdk: np.ndarray | None = None
+    last_gripper_sent_sdk: np.ndarray | None = None
     total_rows = safe_policy_targets.shape[0]
     trigger_row = min(total_rows, max(1, int(np.ceil(total_rows * min(max(prefetch_fraction, 0.0), 1.0)))))
     prefetch_triggered = False
+    execution_started_at = time.time()
+    first_command_at: float | None = None
+    row_execution_log: list[dict[str, object]] = []
+
+    def _mark_command_sent() -> None:
+        nonlocal first_command_at
+        if first_command_at is None:
+            first_command_at = time.time()
+
     for row_index, safe_policy_target in enumerate(safe_policy_targets):
+        row_started_at = time.time()
         target_sdk = _policy_to_sdk_arm(safe_policy_target, sdk_arm_order)
+        arm_points_before_row = move_arm_points
         if prev_sdk is None:
             segment = [target_sdk.astype(np.float32).tolist()]
         else:
@@ -899,10 +1079,15 @@ def _execute_arm_trajectory(
             if should_stop():
                 raise _StopRequested
             robot.move_arm(point)
+            _mark_command_sent()
             move_arm_points += 1
             _sleep_with_stop(limits.arm_trajectory_interval, should_stop)
 
         row_parts = _parse_action_row(arr[row_index], arr.shape[0])
+        safe_waist: np.ndarray | None = None
+        safe_wheel: np.ndarray | None = None
+        waist_sent = False
+        wheel_sent = False
 
         waist_target = row_parts["waist"].astype(np.float32)
         if _is_finite_vector(waist_target):
@@ -916,8 +1101,10 @@ def _execute_arm_trajectory(
                     ],
                     dtype=np.float32,
                 )
-                robot.move_waist(safe_waist.tolist())
+                robot.move_waist(_policy_waist_to_sdk(safe_waist).tolist())
+                _mark_command_sent()
                 waist_rows_sent += 1
+                waist_sent = True
                 if first_waist_sent is None:
                     first_waist_sent = safe_waist
                 last_waist_sent = safe_waist
@@ -926,16 +1113,60 @@ def _execute_arm_trajectory(
         if enable_wheel and _is_finite_vector(wheel_target):
             safe_wheel = _clip_wheel_command(wheel_target, limits)
             robot.move_wheel(float(safe_wheel[0]), float(safe_wheel[1]))
+            _mark_command_sent()
             wheel_rows_sent += 1
+            wheel_sent = True
             if first_wheel_sent is None:
                 first_wheel_sent = safe_wheel
             last_wheel_sent = safe_wheel
+
+        row_gripper_policy = _gripper_policy_to_command(row_parts["gripper"], gripper_config)
+        row_gripper_sdk = _policy_gripper_to_sdk(row_gripper_policy)
+        gripper_sent = False
+        if enable_gripper and (
+            last_gripper_sent_sdk is None
+            or np.max(np.abs(row_gripper_sdk - last_gripper_sent_sdk)) > 1e-6
+        ):
+            robot.move_gripper(row_gripper_sdk.tolist())
+            _mark_command_sent()
+            gripper_updates += 1
+            if first_gripper_sent_policy is None:
+                first_gripper_sent_policy = row_gripper_policy
+            last_gripper_sent_policy = row_gripper_policy
+            last_gripper_sent_sdk = row_gripper_sdk
+            gripper_sent = True
+
+        if log_row_execution:
+            row_execution_log.append(
+                _make_row_execution_record(
+                    row_index=row_index,
+                    total_rows=total_rows,
+                    row_started_at=row_started_at,
+                    execution_started_at=execution_started_at,
+                    safe_policy_target=safe_policy_target,
+                    row_parts=row_parts,
+                    safe_waist=safe_waist,
+                    safe_wheel=safe_wheel,
+                    row_gripper_policy=row_gripper_policy,
+                    row_gripper_sdk=row_gripper_sdk,
+                    arm_points_sent_this_row=move_arm_points - arm_points_before_row,
+                    waist_sent=waist_sent,
+                    wheel_sent=wheel_sent,
+                    gripper_sent=gripper_sent,
+                )
+            )
 
         prev_sdk = np.asarray(target_sdk, dtype=np.float32)
         if on_row_complete is not None and not prefetch_triggered and (row_index + 1) >= trigger_row:
             on_row_complete(row_index + 1, total_rows)
             prefetch_triggered = True
 
+    if enable_wheel and wheel_rows_sent > 0:
+        robot.move_wheel(0.0, 0.0)
+        wheel_stop_sent = True
+        _mark_command_sent()
+
+    stream_finished_at = time.time()
     wait_result = _wait_arm_close(
         robot=robot,
         target_policy_arm=safe_policy_targets[-1],
@@ -943,6 +1174,7 @@ def _execute_arm_trajectory(
         timeout_s=limits.arm_close_timeout,
         should_stop=should_stop,
     )
+    execution_finished_at = time.time()
     waist_after, _ = robot.waist_joint_states()
     return {
         "arm_cur_sdk": arm_cur_sdk,
@@ -953,45 +1185,241 @@ def _execute_arm_trajectory(
         "move_arm_points": np.asarray([move_arm_points], dtype=np.int32),
         "waist_rows_sent": np.asarray([waist_rows_sent], dtype=np.int32),
         "wheel_rows_sent": np.asarray([wheel_rows_sent], dtype=np.int32),
+        "wheel_stop_sent": np.asarray([int(wheel_stop_sent)], dtype=np.int32),
+        "gripper_updates": np.asarray([gripper_updates], dtype=np.int32),
         "first_waist_sent": np.zeros(2, dtype=np.float32) if first_waist_sent is None else first_waist_sent,
         "last_waist_sent": np.zeros(2, dtype=np.float32) if last_waist_sent is None else last_waist_sent,
         "first_wheel_sent": np.zeros(2, dtype=np.float32) if first_wheel_sent is None else first_wheel_sent,
         "last_wheel_sent": np.zeros(2, dtype=np.float32) if last_wheel_sent is None else last_wheel_sent,
+        "first_gripper_sent_policy": np.zeros(2, dtype=np.float32) if first_gripper_sent_policy is None else first_gripper_sent_policy,
+        "last_gripper_sent_policy": np.zeros(2, dtype=np.float32) if last_gripper_sent_policy is None else last_gripper_sent_policy,
         "waist_after": np.asarray(waist_after, dtype=np.float32),
         "arm_after_policy": wait_result["arm_after_policy"],
         "arm_error": wait_result["arm_error"],
         "left_error": wait_result["left_error"],
         "right_error": wait_result["right_error"],
         "reached": wait_result["reached"],
+        "execution_started_at": execution_started_at,
+        "first_command_at": execution_started_at if first_command_at is None else first_command_at,
+        "stream_finished_at": stream_finished_at,
+        "wait_started_at": wait_result["wait_started_at"],
+        "wait_finished_at": wait_result["wait_finished_at"],
+        "execution_finished_at": execution_finished_at,
+        "first_command_delay_seconds": (execution_started_at if first_command_at is None else first_command_at) - execution_started_at,
+        "stream_duration_seconds": stream_finished_at - execution_started_at,
+        "wait_duration_seconds": wait_result["wait_duration_seconds"],
+        "execution_duration_seconds": execution_finished_at - execution_started_at,
+        "row_execution_log": row_execution_log,
+    }
+
+
+def _execute_arm_direct48(
+    robot: Robot,
+    actions: np.ndarray,
+    limits: Limits,
+    sdk_arm_order: ArmOrder,
+    gripper_config: GripperConfig,
+    enable_gripper: bool,
+    enable_wheel: bool,
+    should_stop: Callable[[], bool],
+    on_row_complete: Callable[[int, int], None] | None = None,
+    prefetch_fraction: float = 1.0,
+    log_row_execution: bool = False,
+) -> dict[str, np.ndarray | int | float | bool]:
+    arr = np.asarray(actions, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[1] < 22:
+        raise RuntimeError(f"Invalid action shape: {arr.shape}")
+
+    arm_cur, _ = robot.arm_joint_states()
+    arm_cur_sdk = np.asarray(arm_cur, dtype=np.float32)
+    arm_cur_policy = _sdk_to_policy_arm(arm_cur_sdk, sdk_arm_order)
+    safe_policy_targets = _build_safe_arm_targets(actions, arm_cur_policy, limits)
+
+    move_arm_points = 0
+    waist_rows_sent = 0
+    wheel_rows_sent = 0
+    wheel_stop_sent = False
+    gripper_updates = 0
+    first_waist_sent: np.ndarray | None = None
+    last_waist_sent: np.ndarray | None = None
+    first_wheel_sent: np.ndarray | None = None
+    last_wheel_sent: np.ndarray | None = None
+    first_gripper_sent_policy: np.ndarray | None = None
+    last_gripper_sent_policy: np.ndarray | None = None
+    last_gripper_sent_sdk: np.ndarray | None = None
+
+    total_rows = safe_policy_targets.shape[0]
+    trigger_row = min(total_rows, max(1, int(np.ceil(total_rows * min(max(prefetch_fraction, 0.0), 1.0)))))
+    prefetch_triggered = False
+    row_interval_s = 1.0 / max(limits.direct_control_hz, 1e-6)
+    execution_started_at = time.time()
+    first_command_at: float | None = None
+    row_execution_log: list[dict[str, object]] = []
+
+    def _mark_command_sent() -> None:
+        nonlocal first_command_at
+        if first_command_at is None:
+            first_command_at = time.time()
+
+    for row_index, safe_policy_target in enumerate(safe_policy_targets):
+        if should_stop():
+            raise _StopRequested
+
+        row_started_at = time.time()
+        arm_points_before_row = move_arm_points
+        target_sdk = _policy_to_sdk_arm(safe_policy_target, sdk_arm_order)
+        robot.move_arm(target_sdk.astype(np.float32).tolist())
+        _mark_command_sent()
+        move_arm_points += 1
+
+        row_parts = _parse_action_row(arr[row_index], arr.shape[0])
+        safe_waist: np.ndarray | None = None
+        safe_wheel: np.ndarray | None = None
+        waist_sent = False
+        wheel_sent = False
+
+        waist_target = row_parts["waist"].astype(np.float32)
+        if _is_finite_vector(waist_target):
+            waist_cur, _ = robot.waist_joint_states()
+            waist_cur = np.asarray(waist_cur, dtype=np.float32)
+            if waist_cur.shape[0] == 2:
+                safe_waist = np.asarray(
+                    [
+                        _clip_delta(waist_target[:1], waist_cur[:1], limits.waist_pitch_delta)[0],
+                        _clip_delta(waist_target[1:], waist_cur[1:], limits.waist_lift_delta)[0],
+                    ],
+                    dtype=np.float32,
+                )
+                robot.move_waist(_policy_waist_to_sdk(safe_waist).tolist())
+                _mark_command_sent()
+                waist_rows_sent += 1
+                waist_sent = True
+                if first_waist_sent is None:
+                    first_waist_sent = safe_waist
+                last_waist_sent = safe_waist
+
+        wheel_target = row_parts["wheel"].astype(np.float32)
+        if enable_wheel and _is_finite_vector(wheel_target):
+            safe_wheel = _clip_wheel_command(wheel_target, limits)
+            robot.move_wheel(float(safe_wheel[0]), float(safe_wheel[1]))
+            _mark_command_sent()
+            wheel_rows_sent += 1
+            wheel_sent = True
+            if first_wheel_sent is None:
+                first_wheel_sent = safe_wheel
+            last_wheel_sent = safe_wheel
+
+        row_gripper_policy = _gripper_policy_to_command(row_parts["gripper"], gripper_config)
+        row_gripper_sdk = _policy_gripper_to_sdk(row_gripper_policy)
+        gripper_sent = False
+        if enable_gripper and (
+            last_gripper_sent_sdk is None
+            or np.max(np.abs(row_gripper_sdk - last_gripper_sent_sdk)) > 1e-6
+        ):
+            robot.move_gripper(row_gripper_sdk.tolist())
+            _mark_command_sent()
+            gripper_updates += 1
+            if first_gripper_sent_policy is None:
+                first_gripper_sent_policy = row_gripper_policy
+            last_gripper_sent_policy = row_gripper_policy
+            last_gripper_sent_sdk = row_gripper_sdk
+            gripper_sent = True
+
+        if log_row_execution:
+            row_execution_log.append(
+                _make_row_execution_record(
+                    row_index=row_index,
+                    total_rows=total_rows,
+                    row_started_at=row_started_at,
+                    execution_started_at=execution_started_at,
+                    safe_policy_target=safe_policy_target,
+                    row_parts=row_parts,
+                    safe_waist=safe_waist,
+                    safe_wheel=safe_wheel,
+                    row_gripper_policy=row_gripper_policy,
+                    row_gripper_sdk=row_gripper_sdk,
+                    arm_points_sent_this_row=move_arm_points - arm_points_before_row,
+                    waist_sent=waist_sent,
+                    wheel_sent=wheel_sent,
+                    gripper_sent=gripper_sent,
+                )
+            )
+
+        if on_row_complete is not None and not prefetch_triggered and (row_index + 1) >= trigger_row:
+            on_row_complete(row_index + 1, total_rows)
+            prefetch_triggered = True
+
+        next_tick_at = execution_started_at + (row_index + 1) * row_interval_s
+        _sleep_with_stop(next_tick_at - time.time(), should_stop)
+
+    if enable_wheel and wheel_rows_sent > 0:
+        robot.move_wheel(0.0, 0.0)
+        wheel_stop_sent = True
+        _mark_command_sent()
+
+    stream_finished_at = time.time()
+    wait_result = _wait_arm_close(
+        robot=robot,
+        target_policy_arm=safe_policy_targets[-1],
+        sdk_arm_order=sdk_arm_order,
+        timeout_s=limits.arm_close_timeout,
+        should_stop=should_stop,
+    )
+    execution_finished_at = time.time()
+    waist_after, _ = robot.waist_joint_states()
+    return {
+        "arm_cur_sdk": arm_cur_sdk,
+        "arm_cur_policy": arm_cur_policy,
+        "first_arm_policy": safe_policy_targets[0],
+        "last_arm_policy": safe_policy_targets[-1],
+        "target_rows": np.asarray([safe_policy_targets.shape[0]], dtype=np.int32),
+        "move_arm_points": np.asarray([move_arm_points], dtype=np.int32),
+        "waist_rows_sent": np.asarray([waist_rows_sent], dtype=np.int32),
+        "wheel_rows_sent": np.asarray([wheel_rows_sent], dtype=np.int32),
+        "wheel_stop_sent": np.asarray([int(wheel_stop_sent)], dtype=np.int32),
+        "gripper_updates": np.asarray([gripper_updates], dtype=np.int32),
+        "first_waist_sent": np.zeros(2, dtype=np.float32) if first_waist_sent is None else first_waist_sent,
+        "last_waist_sent": np.zeros(2, dtype=np.float32) if last_waist_sent is None else last_waist_sent,
+        "first_wheel_sent": np.zeros(2, dtype=np.float32) if first_wheel_sent is None else first_wheel_sent,
+        "last_wheel_sent": np.zeros(2, dtype=np.float32) if last_wheel_sent is None else last_wheel_sent,
+        "first_gripper_sent_policy": np.zeros(2, dtype=np.float32) if first_gripper_sent_policy is None else first_gripper_sent_policy,
+        "last_gripper_sent_policy": np.zeros(2, dtype=np.float32) if last_gripper_sent_policy is None else last_gripper_sent_policy,
+        "waist_after": np.asarray(waist_after, dtype=np.float32),
+        "arm_after_policy": wait_result["arm_after_policy"],
+        "arm_error": wait_result["arm_error"],
+        "left_error": wait_result["left_error"],
+        "right_error": wait_result["right_error"],
+        "reached": wait_result["reached"],
+        "execution_started_at": execution_started_at,
+        "first_command_at": execution_started_at if first_command_at is None else first_command_at,
+        "stream_finished_at": stream_finished_at,
+        "wait_started_at": wait_result["wait_started_at"],
+        "wait_finished_at": wait_result["wait_finished_at"],
+        "execution_finished_at": execution_finished_at,
+        "first_command_delay_seconds": (execution_started_at if first_command_at is None else first_command_at) - execution_started_at,
+        "stream_duration_seconds": stream_finished_at - execution_started_at,
+        "wait_duration_seconds": wait_result["wait_duration_seconds"],
+        "execution_duration_seconds": execution_finished_at - execution_started_at,
+        "row_execution_log": row_execution_log,
     }
 
 
 def _apply_aux_actions(
     robot: Robot,
     parsed: dict[str, np.ndarray],
-    gripper_command_policy: np.ndarray,
     limits: Limits,
-    enable_gripper: bool,
 ) -> dict[str, np.ndarray]:
     head_cur, _ = robot.head_joint_states()
 
-    head_cur = np.asarray(head_cur, dtype=np.float32)
+    head_cur = _angles_to_policy_radians(head_cur)
     if head_cur.shape[0] != 2:
         raise RuntimeError(f"head_joint_states length must be 2, got {head_cur.shape[0]}")
 
     head_target = parsed["head"].astype(np.float32)
     safe_head = _clip_delta(head_target, head_cur, limits.head_delta)
-
-    safe_gripper_policy = np.clip(gripper_command_policy, 0.0, 1.0).astype(np.float32)
-    safe_gripper_sdk = _policy_gripper_to_sdk(safe_gripper_policy)
-
-    if enable_gripper:
-        robot.move_gripper(safe_gripper_sdk.tolist())
     robot.move_head(safe_head.tolist())
 
     return {
-        "gripper": safe_gripper_sdk,
-        "gripper_policy": safe_gripper_policy,
         "head": safe_head,
     }
 
@@ -1013,12 +1441,15 @@ def run_client(
     enable_gripper: bool,
     enable_wheel: bool,
     limits: Limits,
+    arm_execution_mode: ArmExecutionMode,
     sdk_arm_order: ArmOrder,
     obs_flip_config: ObsFlipConfig,
     gripper_config: GripperConfig,
     observation_fps: float,
     observation_history: int,
     speculative_config: SpeculativeConfig,
+    smoothing_config: ActionSmoothingConfig,
+    log_row_execution: bool,
 ) -> None:
     logging.info("Connecting to AgiBot server at %s:%s...", host, port)
     client = WebsocketClientPolicy(host=host, port=port)
@@ -1061,8 +1492,14 @@ def run_client(
     action_records: list[dict[str, object]] = []
     logging.info("Starting live client, session_id=%s", session_id)
     logging.info(
-        "Client config: sdk_arm_order=%s apply_actions=%s enable_gripper=%s enable_wheel=%s observation_fps=%.2f observation_interval=%.3fs arm_interval=%.4fs arm_close_timeout=%.2fs obs_flip_left=%s obs_flip_right=%s gripper_threshold=%.2f gripper_close_when_high=%s speculative_enabled=%s action_log_path=%s",
+        "Client config: sdk_arm_order=%s arm_execution_mode=%s direct_control_hz=%.2f action_smoothing=%s savgol_window=%s savgol_polyorder=%s savgol_upsample=%s apply_actions=%s enable_gripper=%s enable_wheel=%s observation_fps=%.2f observation_interval=%.3fs arm_interval=%.4fs arm_close_timeout=%.2fs obs_flip_left=%s obs_flip_right=%s gripper_threshold=%.2f gripper_close_when_high=%s speculative_enabled=%s log_row_execution=%s action_log_path=%s",
         sdk_arm_order,
+        arm_execution_mode,
+        limits.direct_control_hz,
+        smoothing_config.mode,
+        smoothing_config.window,
+        smoothing_config.polyorder,
+        smoothing_config.upsample,
         apply_actions,
         enable_gripper,
         enable_wheel,
@@ -1075,6 +1512,7 @@ def run_client(
         gripper_config.close_threshold,
         gripper_config.close_when_high,
         speculative_config.enabled,
+        log_row_execution,
         action_log_path,
     )
     _maybe_warn_sdk_order(sdk_arm_order)
@@ -1119,7 +1557,9 @@ def run_client(
                         raise RuntimeError("Inference worker stopped before sync inference completed.")
                     inference_source = "sync"
 
-                actions = infer_result.actions
+                action_received_at = time.time()
+                raw_actions = np.asarray(infer_result.actions, dtype=np.float32)
+                actions, smoothing_duration_s = _maybe_smooth_actions(raw_actions, smoothing_config)
                 parsed = _parse_action_first(actions)
                 gripper_plan = _select_gripper_command(actions, gripper_config)
                 last_used_sequence_latest_sampled_at = prepared.latest_sampled_at
@@ -1179,6 +1619,9 @@ def run_client(
                     "prompt": prompt,
                     "inference_source": inference_source,
                     "dt_seconds": round(infer_result.duration_s, 6),
+                    "inference_completed_at_seconds": round(infer_result.completed_at, 6),
+                    "action_received_at_seconds": round(action_received_at, 6),
+                    "action_receive_delay_after_inference_seconds": round(action_received_at - infer_result.completed_at, 6),
                     "observation_fps_target": float(observation_fps),
                     "observation_history_frames": int(observation_history),
                     "observation_interval_target_seconds": round(observation_interval_s, 6),
@@ -1196,8 +1639,16 @@ def run_client(
                     "shape": list(actions.shape),
                     "sdk_observation_arm_order": sdk_arm_order,
                     "sdk_execution_arm_order": sdk_arm_order,
+                    "arm_execution_mode": arm_execution_mode,
+                    "direct_control_hz": float(limits.direct_control_hz),
+                    "action_smoothing": smoothing_config.mode,
+                    "action_smoothing_duration_seconds": round(smoothing_duration_s, 6),
+                    "savgol_window": int(smoothing_config.window),
+                    "savgol_polyorder": int(smoothing_config.polyorder),
+                    "savgol_upsample": int(smoothing_config.upsample),
                     "apply_actions": bool(apply_actions),
                     "speculative_enabled": bool(speculative_config.enabled),
+                    "log_row_execution": bool(log_row_execution),
                     "obs_flip_left_joint_indices": list(obs_flip_config.left_joint_indices),
                     "obs_flip_right_joint_indices": list(obs_flip_config.right_joint_indices),
                     "raw_sdk_arm_joint_states": prepared.arm_pos_sdk.tolist(),
@@ -1217,11 +1668,13 @@ def run_client(
                     "predicted_last_gripper_position": gripper_plan["last_policy"].tolist(),
                     "predicted_last_waist_position": np.asarray(actions[-1][18:20], dtype=np.float32).tolist(),
                     "predicted_last_wheel_command": np.asarray(actions[-1][20:22], dtype=np.float32).tolist(),
-                    "executed_gripper_command_policy": gripper_plan["command_policy"].tolist(),
+                    "executed_gripper_command_policy": [],
                     "speculative_prefetch_submitted": False,
                     "speculative_prefetch_result_ready_at_boundary": False,
+                    "speculative_prefetch_result_ready_late": False,
                     "speculative_prefetch_accepted": False,
                     "speculative_prefetch_reject_reason": "",
+                    "raw_actions": raw_actions.tolist(),
                     "actions": actions.tolist(),
                 }
 
@@ -1276,45 +1729,69 @@ def run_client(
                             speculative_prepared.latest_sampled_at,
                         )
 
+                    execution_call_started_at = time.time()
                     try:
-                        trajectory = _execute_arm_trajectory(
+                        execute_fn = _execute_arm_direct48 if arm_execution_mode == "direct-48" else _execute_arm_trajectory
+                        trajectory = execute_fn(
                             robot=robot,
                             actions=actions,
                             limits=limits,
                             sdk_arm_order=sdk_arm_order,
+                            gripper_config=gripper_config,
+                            enable_gripper=enable_gripper,
                             enable_wheel=enable_wheel,
                             should_stop=keyboard_monitor.consume_stop_request,
                             on_row_complete=_maybe_submit_speculative if speculative_config.enabled else None,
                             prefetch_fraction=speculative_config.prefetch_fraction,
+                            log_row_execution=log_row_execution,
                         )
                     except _StopRequested:
+                        if enable_wheel:
+                            robot.move_wheel(0.0, 0.0)
                         logging.info("Stop hotkey received during move_arm trajectory execution. Exiting immediately.")
                         break
+                    trajectory_returned_at = time.time()
+                    aux_started_at = time.time()
                     aux = _apply_aux_actions(
                         robot=robot,
                         parsed=parsed,
-                        gripper_command_policy=gripper_plan["command_policy"],
                         limits=limits,
-                        enable_gripper=enable_gripper,
                     )
+                    aux_finished_at = time.time()
+                    action_to_execution_call_delay_s = execution_call_started_at - action_received_at
+                    action_to_first_command_delay_s = float(trajectory["first_command_at"]) - action_received_at
                     logging.info(
-                        "Executed move_arm dual-arm trajectory | target_rows=%s move_arm_points=%s waist_rows=%s wheel_rows=%s cur_left[:3]=%s cur_right[:3]=%s first_left[:3]=%s first_right[:3]=%s last_left[:3]=%s last_right[:3]=%s grip=%s head=%s waist_first=%s waist_last=%s wheel_first=%s wheel_last=%s",
+                        "Executed move_arm dual-arm trajectory with row-synced gripper | target_rows=%s move_arm_points=%s waist_rows=%s wheel_rows=%s wheel_stop=%s gripper_updates=%s cur_left[:3]=%s cur_right[:3]=%s first_left[:3]=%s first_right[:3]=%s last_left[:3]=%s last_right[:3]=%s grip_first=%s grip_last=%s head=%s waist_first=%s waist_last=%s wheel_first=%s wheel_last=%s",
                         int(trajectory["target_rows"][0]),
                         int(trajectory["move_arm_points"][0]),
                         int(trajectory["waist_rows_sent"][0]),
                         int(trajectory["wheel_rows_sent"][0]),
+                        bool(int(trajectory["wheel_stop_sent"][0])),
+                        int(trajectory["gripper_updates"][0]),
                         np.round(trajectory["arm_cur_policy"][:3], 4).tolist(),
                         np.round(trajectory["arm_cur_policy"][7:10], 4).tolist(),
                         np.round(trajectory["first_arm_policy"][:3], 4).tolist(),
                         np.round(trajectory["first_arm_policy"][7:10], 4).tolist(),
                         np.round(trajectory["last_arm_policy"][:3], 4).tolist(),
                         np.round(trajectory["last_arm_policy"][7:10], 4).tolist(),
-                        np.round(aux["gripper"], 4).tolist(),
+                        np.round(trajectory["first_gripper_sent_policy"], 4).tolist(),
+                        np.round(trajectory["last_gripper_sent_policy"], 4).tolist(),
                         np.round(aux["head"], 4).tolist(),
                         np.round(trajectory["first_waist_sent"], 4).tolist(),
                         np.round(trajectory["last_waist_sent"], 4).tolist(),
                         np.round(trajectory["first_wheel_sent"], 4).tolist(),
                         np.round(trajectory["last_wheel_sent"], 4).tolist(),
+                    )
+                    logging.info(
+                        "Timing | infer_dt=%.3fs action_to_exec_call=%.3fs action_to_first_cmd=%.3fs stream=%.3fs wait_close=%.3fs chunk_exec=%.3fs aux=%.3fs total_after_action=%.3fs",
+                        infer_result.duration_s,
+                        action_to_execution_call_delay_s,
+                        action_to_first_command_delay_s,
+                        float(trajectory["stream_duration_seconds"]),
+                        float(trajectory["wait_duration_seconds"]),
+                        float(trajectory["execution_duration_seconds"]),
+                        aux_finished_at - aux_started_at,
+                        aux_finished_at - action_received_at,
                     )
                     logging.info(
                         "Post-trajectory state | left[:3]=%s right[:3]=%s delta_from_pre_left[:3]=%s delta_from_pre_right[:3]=%s waist=%s arm_error_to_target=%.4f left_error=%.4f right_error=%.4f reached=%s",
@@ -1330,12 +1807,14 @@ def run_client(
                     )
 
                     if speculative_request is not None:
-                        speculative_result = worker.wait_for_result(
-                            speculative_request.request_id,
-                            timeout_s=speculative_config.max_boundary_wait_s,
-                        )
-                        if speculative_result is not None:
-                            action_record["speculative_prefetch_result_ready_at_boundary"] = True
+                        def _record_speculative_evaluation(
+                            speculative_result: InferenceResult,
+                            *,
+                            ready_at_boundary: bool,
+                        ) -> None:
+                            nonlocal prefetched_result
+                            action_record["speculative_prefetch_result_ready_at_boundary"] = bool(ready_at_boundary)
+                            action_record["speculative_prefetch_result_ready_late"] = not bool(ready_at_boundary)
                             action_record["speculative_prefetch_infer_dt_seconds"] = round(
                                 speculative_result.duration_s, 6
                             )
@@ -1369,7 +1848,8 @@ def run_client(
                             if bool(speculative_evaluation["accepted"]):
                                 prefetched_result = speculative_result
                                 logging.info(
-                                    "Accepted speculative result for next step | arm_delta=%.4f waist_delta=%.4f age=%.3fs infer_dt=%.3fs",
+                                    "Accepted speculative result for next step | ready_at_boundary=%s arm_delta=%.4f waist_delta=%.4f age=%.3fs infer_dt=%.3fs",
+                                    ready_at_boundary,
                                     float(speculative_evaluation["arm_delta_max"]),
                                     float(speculative_evaluation["waist_delta_max"]),
                                     float(speculative_evaluation["state_age_s"]),
@@ -1377,23 +1857,58 @@ def run_client(
                                 )
                             else:
                                 logging.info(
-                                    "Rejected speculative result | reason=%s head_delta=%.4f gripper_delta=%.4f",
+                                    "Rejected speculative result | ready_at_boundary=%s reason=%s head_delta=%.4f gripper_delta=%.4f",
+                                    ready_at_boundary,
                                     speculative_evaluation["reason"],
                                     float(speculative_evaluation["head_delta_max"]),
                                     float(speculative_evaluation["gripper_delta_max"]),
                                 )
+
+                        speculative_result = worker.wait_for_result(
+                            speculative_request.request_id,
+                            timeout_s=speculative_config.max_boundary_wait_s,
+                        )
+                        if speculative_result is not None:
+                            _record_speculative_evaluation(speculative_result, ready_at_boundary=True)
                         else:
-                            action_record["speculative_prefetch_reject_reason"] = "result_not_ready_at_boundary"
-                            worker.forget_request(speculative_request.request_id)
-                            logging.info("Speculative result not ready at boundary; next step will fall back to sync inference.")
+                            action_record["speculative_prefetch_reject_reason"] = "result_not_ready_at_boundary_waiting_late"
+                            logging.info(
+                                "Speculative result not ready at boundary; waiting for the in-flight result to avoid a busy worker."
+                            )
+                            late_result = worker.wait_for_result(speculative_request.request_id, timeout_s=None)
+                            if late_result is None:
+                                action_record["speculative_prefetch_reject_reason"] = "worker_stopped_before_late_result"
+                            else:
+                                _record_speculative_evaluation(late_result, ready_at_boundary=False)
 
                     action_record.update(
                         {
-                            "execution_mode": "move_arm_ruckig_with_waist_stream",
+                            "execution_mode": f"move_arm_{arm_execution_mode}_with_row_synced_gripper",
+                            "executed_gripper_command_policy": trajectory["last_gripper_sent_policy"].tolist(),
+                            "trajectory_gripper_updates": int(trajectory["gripper_updates"][0]),
+                            "trajectory_first_gripper_command_policy": trajectory["first_gripper_sent_policy"].tolist(),
+                            "trajectory_last_gripper_command_policy": trajectory["last_gripper_sent_policy"].tolist(),
+                            "execution_call_started_at_seconds": round(execution_call_started_at, 6),
+                            "first_robot_command_at_seconds": round(float(trajectory["first_command_at"]), 6),
+                            "trajectory_stream_finished_at_seconds": round(float(trajectory["stream_finished_at"]), 6),
+                            "trajectory_wait_started_at_seconds": round(float(trajectory["wait_started_at"]), 6),
+                            "trajectory_wait_finished_at_seconds": round(float(trajectory["wait_finished_at"]), 6),
+                            "trajectory_returned_at_seconds": round(trajectory_returned_at, 6),
+                            "aux_action_started_at_seconds": round(aux_started_at, 6),
+                            "aux_action_finished_at_seconds": round(aux_finished_at, 6),
+                            "action_to_execution_call_delay_seconds": round(action_to_execution_call_delay_s, 6),
+                            "action_to_first_robot_command_delay_seconds": round(action_to_first_command_delay_s, 6),
+                            "trajectory_first_command_internal_delay_seconds": round(float(trajectory["first_command_delay_seconds"]), 6),
+                            "trajectory_stream_duration_seconds": round(float(trajectory["stream_duration_seconds"]), 6),
+                            "trajectory_wait_close_duration_seconds": round(float(trajectory["wait_duration_seconds"]), 6),
+                            "chunk_execution_duration_seconds": round(float(trajectory["execution_duration_seconds"]), 6),
+                            "aux_action_duration_seconds": round(aux_finished_at - aux_started_at, 6),
+                            "total_after_action_received_duration_seconds": round(aux_finished_at - action_received_at, 6),
                             "trajectory_rows": int(trajectory["target_rows"][0]),
                             "move_arm_points": int(trajectory["move_arm_points"][0]),
                             "trajectory_waist_rows_sent": int(trajectory["waist_rows_sent"][0]),
                             "trajectory_wheel_rows_sent": int(trajectory["wheel_rows_sent"][0]),
+                            "trajectory_wheel_stop_sent": bool(int(trajectory["wheel_stop_sent"][0])),
                             "trajectory_first_left_arm_joint_position": trajectory["first_arm_policy"][:7].tolist(),
                             "trajectory_first_right_arm_joint_position": trajectory["first_arm_policy"][7:14].tolist(),
                             "trajectory_last_left_arm_joint_position": trajectory["last_arm_policy"][:7].tolist(),
@@ -1409,6 +1924,7 @@ def run_client(
                             "post_left_arm_error_to_target": round(float(trajectory["left_error"]), 6),
                             "post_right_arm_error_to_target": round(float(trajectory["right_error"]), 6),
                             "post_arm_reached_target": bool(trajectory["reached"]),
+                            "row_execution_log": trajectory["row_execution_log"],
                         }
                     )
                 else:
@@ -1515,6 +2031,12 @@ def main() -> None:
     parser.add_argument("--disable-gripper", action="store_true", help="Do not send gripper commands during execution")
     parser.add_argument("--gripper-close-threshold", type=float, default=0.5)
     parser.add_argument(
+        "--gripper-closed-value",
+        type=float,
+        default=1.0,
+        help="Gripper command value sent when the model predicts close. Lower values make softer grasps.",
+    )
+    parser.add_argument(
         "--gripper-close-when-low",
         action="store_true",
         help="Interpret low gripper logits/targets as close instead of high values as close.",
@@ -1533,10 +2055,36 @@ def main() -> None:
         help="Seconds between streamed move_arm trajectory points. Lower is faster but more aggressive.",
     )
     parser.add_argument(
+        "--arm-execution-mode",
+        choices=["ruckig", "direct-48"],
+        default="ruckig",
+        help="Use ruckig interpolation or send the model's 48 action rows directly at --direct-control-hz.",
+    )
+    parser.add_argument(
+        "--direct-control-hz",
+        type=float,
+        default=15.0,
+        help="Row frequency for --arm-execution-mode direct-48. 15 Hz is a conservative first test; 30 Hz targets the paper timing.",
+    )
+    parser.add_argument(
         "--arm-close-timeout",
         type=float,
         default=DEFAULT_MOVE_ARM_TIMEOUT_S,
         help="Max seconds to wait after sending the arm trajectory before starting next inference. Set lower to speed up.",
+    )
+    parser.add_argument(
+        "--action-smoothing",
+        choices=["none", "savgol"],
+        default="none",
+        help="Optional action smoothing before execution. Savgol only smooths the 14 arm joint dimensions.",
+    )
+    parser.add_argument("--savgol-window", type=int, default=7)
+    parser.add_argument("--savgol-polyorder", type=int, default=2)
+    parser.add_argument("--savgol-upsample", type=int, default=2)
+    parser.add_argument(
+        "--log-row-execution",
+        action="store_true",
+        help="Record per-row command targets and send timing in the action JSON log. Does not read robot state per row.",
     )
     parser.add_argument(
         "--sdk-arm-order",
@@ -1566,6 +2114,7 @@ def main() -> None:
         angular_velocity=args.angular_velocity_limit,
         arm_trajectory_interval=args.arm_trajectory_interval,
         arm_close_timeout=args.arm_close_timeout,
+        direct_control_hz=args.direct_control_hz,
     )
 
     run_client(
@@ -1576,6 +2125,7 @@ def main() -> None:
         enable_gripper=not args.disable_gripper,
         enable_wheel=args.apply_wheel_actions,
         limits=limits,
+        arm_execution_mode=args.arm_execution_mode,
         sdk_arm_order=args.sdk_arm_order,
         obs_flip_config=ObsFlipConfig(
             left_joint_indices=_parse_joint_index_list(args.obs_flip_left_joints),
@@ -1584,6 +2134,7 @@ def main() -> None:
         gripper_config=GripperConfig(
             close_threshold=args.gripper_close_threshold,
             close_when_high=not args.gripper_close_when_low,
+            closed_value=args.gripper_closed_value,
         ),
         observation_fps=args.observation_fps,
         observation_history=args.observation_history,
@@ -1595,6 +2146,13 @@ def main() -> None:
             arm_state_tolerance=args.speculative_arm_state_tolerance,
             waist_state_tolerance=args.speculative_waist_state_tolerance,
         ),
+        smoothing_config=ActionSmoothingConfig(
+            mode=args.action_smoothing,
+            window=args.savgol_window,
+            polyorder=args.savgol_polyorder,
+            upsample=args.savgol_upsample,
+        ),
+        log_row_execution=args.log_row_execution,
     )
 
 
