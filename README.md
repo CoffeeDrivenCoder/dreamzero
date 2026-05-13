@@ -7,7 +7,7 @@ DreamZero is a World Action Model that jointly predicts actions and videos, achi
 
 - **02/27:** DreamZero is **#1 on both [MolmoSpaces]([https://huggingface.co/spaces/ai2-adapt/MolmoSpaces](https://molmospaces.allen.ai/leaderboard)) and [RoboArena]([https://robo-arena.github.io/](https://robo-arena.github.io/leaderboard))**! DreamZero-DROID is trained *from scratch* using only the DROID dataset — no pretraining on large-scale robot data, unlike competing VLAs. This demonstrates the strength of video-model backbones for generalist robot policies (VAMs/WAMs).
 - **02/27:** Released **DreamZero-AgiBot checkpoint** and **post-training code** for efficient few-shot adaptation. Post-train on just ~30 minutes of play data for your specific robot, and see the robot do basic language following and pick-and-place (see YAM experiments in our paper for more detail).
-- **02/20:** Released the **full training codebase, preprocessed dataset, and guide for new embodiments** to replicate the DreamZero-DROID checkpoint and train on your own robot. See [Adding a New Embodiment to DreamZero](docs/DATASET_TO_GEAR_AND_TRAIN.md) for a step-by-step walkthrough.
+- **02/20:** Released the **full training codebase, preprocessed dataset, and guide for new embodiments** to replicate the DreamZero-DROID checkpoint and train on your own robot. See [Adding a New Embodiment to DreamZero](docs/2025-11-01_DreamZero新机器人数据转换与训练指南.md) for a step-by-step walkthrough.
 
 ## Features
 
@@ -20,7 +20,7 @@ DreamZero is a World Action Model that jointly predicts actions and videos, achi
 - [RoboArena](https://robo-arena.github.io/) integration (DROID real)
 - Video generation and saving (MP4)
 - LoRA and full fine-tuning training scripts
-- Training on new embodiments (AgiBot, YAM) — see [guide](docs/DATASET_TO_GEAR_AND_TRAIN.md)
+- Training on new embodiments (AgiBot, YAM) — see [guide](docs/2025-11-01_DreamZero新机器人数据转换与训练指南.md)
 
 **Coming Soon**
 - [PolaRiS](https://polaris-evals.github.io/) simulation environment support
@@ -111,7 +111,7 @@ Or with the Hugging Face CLI:
 hf download GEAR-Dreams/DreamZero-AgiBot --repo-type model --local-dir ./checkpoints/DreamZero-AgiBot
 ```
 
-The YAM and AgiBot training scripts use `pretrained_model_path=./checkpoints/DreamZero-AgiBot` by default. See the [new embodiment guide](docs/DATASET_TO_GEAR_AND_TRAIN.md) for usage.
+The YAM and AgiBot training scripts use `pretrained_model_path=./checkpoints/DreamZero-AgiBot` by default. See the [new embodiment guide](docs/2025-11-01_DreamZero新机器人数据转换与训练指南.md) for usage.
 
 ## Running the Inference Server
 
@@ -148,7 +148,7 @@ The server saves:
 
 ## Training
 
-> **Training on a new embodiment?** See [Adding a New Embodiment to DreamZero](docs/DATASET_TO_GEAR_AND_TRAIN.md) for a complete guide on converting your dataset, configuring modalities, and launching training. <em>Make sure to align the 3 camera view order to ensure positive transfer.</em>
+> **Training on a new embodiment?** See [Adding a New Embodiment to DreamZero](docs/2025-11-01_DreamZero新机器人数据转换与训练指南.md) for a complete guide on converting your dataset, configuring modalities, and launching training. <em>Make sure to align the 3 camera view order to ensure positive transfer.</em>
 
 ### Downloading Pretrained Base Model Weights
 
@@ -186,7 +186,7 @@ This dataset is derived from the [DROID 1.0.1](https://droid-dataset.github.io/)
 huggingface-cli download GEAR-Dreams/DreamZero-DROID-Data --repo-type dataset --local-dir ./data/droid_lerobot
 ```
 
-If you want to reproduce the dataset conversion from raw DROID 1.0.1 yourself (or modify the filtering), see [docs/DROID_CONVERSION.md](docs/DROID_CONVERSION.md).
+If you want to reproduce the dataset conversion from raw DROID 1.0.1 yourself (or modify the filtering), see [docs/2025-11-01_DROID数据转换指南.md](docs/2025-11-01_DROID数据转换指南.md).
 
 ### Running Training
 

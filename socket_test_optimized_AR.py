@@ -11,6 +11,7 @@ import torch
 import tyro
 from einops import rearrange
 import datetime
+import cv2
 
 from groot.vla.model.n1_5.sim_policy import GrootSimPolicy
 from groot.vla.data.schema import EmbodimentTag
@@ -54,6 +55,7 @@ class Args:
     model_path: str = "./checkpoints/dreamzero"
     enable_dit_cache: bool = False  # Backward-compatible alias for num_dit_steps=8.
     num_dit_steps: int | None = None  # Actual DiT compute steps. Supported fast masks: 5, 6, 7, 8. None keeps model default.
+    num_inference_timesteps: int | None = None  # Positive values override diffusion steps; 0 keeps checkpoint default.
     index: int = 0
     embodiment_tag: str = "oxe_droid"
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
@@ -349,6 +351,23 @@ class AgiBotRoboarenaPolicy(DistributedRoboarenaPolicyBase):
         return obs.get(target_key)
 
     def _normalize_video(self, value: object, target_key: str) -> np.ndarray:
+        if isinstance(value, dict) and value.get("__dreamzero_image_encoding__") == "jpeg_sequence":
+            frames = []
+            expected_shape = tuple(value.get("shape", ()))
+            expected_dtype = np.dtype(value.get("dtype", "uint8"))
+            for index, frame_bytes in enumerate(value.get("frames", [])):
+                encoded = np.frombuffer(frame_bytes, dtype=np.uint8)
+                frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+                if frame is None:
+                    raise ValueError(f"Failed to decode JPEG frame {index} for {target_key}")
+                frames.append(frame.astype(expected_dtype, copy=False))
+            array = np.stack(frames, axis=0)
+            if expected_shape and tuple(array.shape) != expected_shape:
+                raise ValueError(
+                    f"Decoded JPEG video for {target_key} has shape {array.shape}, expected {expected_shape}"
+                )
+            return array
+
         array = np.asarray(value)
         if array.ndim == 3:
             return np.expand_dims(array, axis=0)
@@ -710,6 +729,23 @@ def main(args: Args) -> None:
         device_mesh=device_mesh,
     )
     action_head = policy.trained_model.action_head
+    if args.num_inference_timesteps is not None:
+        if args.num_inference_timesteps == 0:
+            logging.info("Keeping checkpoint diffusion inference steps because --num-inference-timesteps=0")
+        elif args.num_inference_timesteps < 0:
+            raise ValueError(
+                f"--num-inference-timesteps must be non-negative, got {args.num_inference_timesteps}"
+            )
+        else:
+            action_head.num_inference_steps = int(args.num_inference_timesteps)
+            action_head.num_inference_timesteps = int(args.num_inference_timesteps)
+            if hasattr(action_head, "config"):
+                action_head.config.num_inference_timesteps = int(args.num_inference_timesteps)
+            logging.info(
+                "Overrode action_head diffusion inference steps to %s on rank %s",
+                args.num_inference_timesteps,
+                rank,
+            )
     logging.info(
         "[CONFIG CHECK] rank=%s action_head.num_inference_steps=%s "
         "action_head.num_inference_timesteps=%s action_head.num_frame_per_block=%s "

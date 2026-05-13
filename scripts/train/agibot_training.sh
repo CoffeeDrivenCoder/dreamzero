@@ -7,7 +7,7 @@
 #
 # Prerequisites:
 #   - AGIbot dataset in LeRobot format at AGIBOT_DATA_ROOT (state 32, action 22, 3 views: top_head, hand_left, hand_right)
-#     See docs/DATASET_TO_GEAR_AND_TRAIN.md for conversion instructions
+#     See docs/2025-11-01_DreamZero新机器人数据转换与训练指南.md for conversion instructions
 #   - Wan2.1-I2V-14B-480P weights (auto-downloaded or pre-downloaded from HuggingFace)
 #     Download: huggingface-cli download Wan-AI/Wan2.1-I2V-14B-480P --local-dir ./checkpoints/Wan2.1-I2V-14B-480P
 #   - umt5-xxl tokenizer (auto-downloaded or pre-downloaded from HuggingFace)

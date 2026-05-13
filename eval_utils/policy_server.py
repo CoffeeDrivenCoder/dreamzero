@@ -78,6 +78,8 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
+            ping_interval=None,
+            ping_timeout=None,
         ) as server:
             await server.serve_forever()
 
@@ -103,6 +105,10 @@ class WebsocketPolicyServer:
                 await websocket.send(to_return)
             except websockets.ConnectionClosed:
                 logging.info(f"Connection from {websocket.remote_address} closed")
+                try:
+                    self._policy.reset({})
+                except Exception:
+                    logging.warning("Policy reset after websocket close failed", exc_info=True)
                 break
             except Exception:
                 await websocket.send(traceback.format_exc())

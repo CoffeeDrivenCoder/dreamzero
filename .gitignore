@@ -204,6 +204,11 @@ pyrightconfig.json
 gear_working_dir/
 
 episode_data/
+robot_json/
+server_received_agibot_inputs/
+video_rollout/
+debug_image/*.mp4
+*.pdf
 
 # third party packages
 third_parties/

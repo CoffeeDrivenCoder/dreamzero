@@ -20,6 +20,29 @@ from openpi_client import msgpack_numpy
 PING_INTERVAL_SECS = None
 PING_TIMEOUT_SECS = None
 
+
+def _payload_summary(obs: Dict) -> Tuple[int, str]:
+    total_bytes = 0
+    parts = []
+    for key, value in obs.items():
+        if isinstance(value, dict) and value.get("__dreamzero_image_encoding__") == "jpeg_sequence":
+            nbytes = sum(len(frame) for frame in value.get("frames", []))
+            total_bytes += int(nbytes)
+            parts.append(
+                f"{key}:encoding=jpeg_sequence shape={tuple(value.get('shape', ()))} "
+                f"quality={value.get('quality')} bytes={int(nbytes)}"
+            )
+            continue
+        nbytes = getattr(value, "nbytes", None)
+        shape = getattr(value, "shape", None)
+        dtype = getattr(value, "dtype", None)
+        if nbytes is None:
+            continue
+        total_bytes += int(nbytes)
+        parts.append(f"{key}:shape={tuple(shape) if shape is not None else '?'} dtype={dtype} bytes={int(nbytes)}")
+    return total_bytes, "; ".join(parts)
+
+
 class WebsocketClientPolicy(BasePolicy):
     """Implements the Policy interface by communicating with a server over websocket.
 
@@ -65,13 +88,44 @@ class WebsocketClientPolicy(BasePolicy):
         # Notify server that we're calling the infer endpoint (as opposed to the reset endpoint)
         obs["endpoint"] = "infer"
 
+        total_started_at = time.perf_counter()
+        payload_bytes, payload_parts = _payload_summary(obs)
+
+        pack_started_at = time.perf_counter()
         data = self._packer.pack(obs)
+        packed_at = time.perf_counter()
+
+        send_started_at = time.perf_counter()
         self._ws.send(data)
+        sent_at = time.perf_counter()
+
+        recv_started_at = time.perf_counter()
         response = self._ws.recv()
+        received_at = time.perf_counter()
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")
-        return msgpack_numpy.unpackb(response)
+
+        unpack_started_at = time.perf_counter()
+        result = msgpack_numpy.unpackb(response)
+        unpacked_at = time.perf_counter()
+
+        logging.info(
+            "Websocket infer timing | total=%.3fs pack=%.3fs send=%.3fs recv_wait=%.3fs unpack=%.3fs "
+            "payload_arrays=%.2fMB packed=%.2fMB response=%.2fMB uri=%s",
+            unpacked_at - total_started_at,
+            packed_at - pack_started_at,
+            sent_at - send_started_at,
+            received_at - recv_started_at,
+            unpacked_at - unpack_started_at,
+            payload_bytes / (1024 * 1024),
+            len(data) / (1024 * 1024),
+            len(response) / (1024 * 1024),
+            self._uri,
+        )
+        if payload_parts:
+            logging.info("Websocket infer payload detail | %s", payload_parts)
+        return result
 
     @override
     def reset(self, reset_info: Dict) -> None:

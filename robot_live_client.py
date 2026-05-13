@@ -54,6 +54,7 @@ def _wait_for_image(camera: Camera, name: str, timeout_s: float = 2.0) -> Tuple[
 ArmOrder = Literal["left_right", "right_left"]
 ArmExecutionMode = Literal["ruckig", "direct-48"]
 ActionSmoothingMode = Literal["none", "savgol"]
+ImageTransportMode = Literal["raw", "jpeg"]
 DEFAULT_SDK_ARM_ORDER: ArmOrder = "left_right"
 ARM_JOINT_COUNT = 14
 RIGHT_ARM_START = 7
@@ -137,6 +138,9 @@ class PreparedObservation:
     gripper_pos_sdk: np.ndarray
     obs_gripper_policy: np.ndarray
     captured_at: float
+    capture_duration_s: float
+    obs_image_payload_bytes: int
+    obs_transmitted_image_payload_bytes: int
 
 
 @dataclass(frozen=True)
@@ -461,6 +465,40 @@ def _policy_gripper_to_sdk(values: list | np.ndarray) -> np.ndarray:
     return pair.copy()
 
 
+def _encode_video_observation(
+    frames: np.ndarray,
+    *,
+    image_transport: ImageTransportMode,
+    jpeg_quality: int,
+) -> object:
+    if image_transport == "raw":
+        return frames
+    if image_transport != "jpeg":
+        raise ValueError(f"Unsupported image_transport: {image_transport}")
+    quality = int(np.clip(jpeg_quality, 1, 100))
+    encoded_frames: list[bytes] = []
+    for frame in frames:
+        success, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        if not success:
+            raise RuntimeError("Failed to JPEG-encode observation frame")
+        encoded_frames.append(encoded.tobytes())
+    return {
+        "__dreamzero_image_encoding__": "jpeg_sequence",
+        "shape": tuple(int(dim) for dim in frames.shape),
+        "dtype": str(frames.dtype),
+        "quality": quality,
+        "frames": encoded_frames,
+    }
+
+
+def _encoded_video_payload_bytes(value: object) -> int:
+    if isinstance(value, np.ndarray):
+        return int(value.nbytes)
+    if isinstance(value, dict) and value.get("__dreamzero_image_encoding__") == "jpeg_sequence":
+        return int(sum(len(frame) for frame in value.get("frames", [])))
+    return 0
+
+
 def _build_obs(
     head_img: np.ndarray,
     left_img: np.ndarray,
@@ -473,11 +511,25 @@ def _build_obs(
     session_id: str,
     sdk_arm_order: ArmOrder,
     obs_flip_config: ObsFlipConfig,
+    image_transport: ImageTransportMode,
+    image_jpeg_quality: int,
 ) -> dict:
     obs: dict[str, object] = {}
-    obs["observation/top_head"] = head_img
-    obs["observation/hand_left"] = left_img
-    obs["observation/hand_right"] = right_img
+    obs["observation/top_head"] = _encode_video_observation(
+        head_img,
+        image_transport=image_transport,
+        jpeg_quality=image_jpeg_quality,
+    )
+    obs["observation/hand_left"] = _encode_video_observation(
+        left_img,
+        image_transport=image_transport,
+        jpeg_quality=image_jpeg_quality,
+    )
+    obs["observation/hand_right"] = _encode_video_observation(
+        right_img,
+        image_transport=image_transport,
+        jpeg_quality=image_jpeg_quality,
+    )
 
     # Arm joints (14) -> left/right 7 each
     arm_pos = _sdk_to_policy_arm(arm_pos, sdk_arm_order)
@@ -611,7 +663,10 @@ def _capture_prepared_observation(
     session_id: str,
     sdk_arm_order: ArmOrder,
     obs_flip_config: ObsFlipConfig,
+    image_transport: ImageTransportMode,
+    image_jpeg_quality: int,
 ) -> PreparedObservation:
+    capture_started_at = time.time()
     sequence = sampler.get_latest_sequence(observation_history)
     if len(sequence) != observation_history:
         raise RuntimeError(
@@ -632,6 +687,7 @@ def _capture_prepared_observation(
     head_imgs = np.stack([sample.head_img for sample in sequence], axis=0)
     left_imgs = np.stack([sample.left_img for sample in sequence], axis=0)
     right_imgs = np.stack([sample.right_img for sample in sequence], axis=0)
+    obs_image_payload_bytes = int(head_imgs.nbytes + left_imgs.nbytes + right_imgs.nbytes)
 
     arm_pos, _ = robot.arm_joint_states()
     head_pos, _ = robot.head_joint_states()
@@ -658,8 +714,15 @@ def _capture_prepared_observation(
         session_id=session_id,
         sdk_arm_order=sdk_arm_order,
         obs_flip_config=obs_flip_config,
+        image_transport=image_transport,
+        image_jpeg_quality=image_jpeg_quality,
+    )
+    obs_transmitted_image_payload_bytes = sum(
+        _encoded_video_payload_bytes(obs[key])
+        for key in ("observation/top_head", "observation/hand_left", "observation/hand_right")
     )
 
+    captured_at = time.time()
     return PreparedObservation(
         step=step,
         mode=mode,
@@ -676,7 +739,10 @@ def _capture_prepared_observation(
         waist_pos=waist_pos_arr,
         gripper_pos_sdk=gripper_pos_sdk,
         obs_gripper_policy=obs_gripper_policy,
-        captured_at=time.time(),
+        captured_at=captured_at,
+        capture_duration_s=captured_at - capture_started_at,
+        obs_image_payload_bytes=obs_image_payload_bytes,
+        obs_transmitted_image_payload_bytes=obs_transmitted_image_payload_bytes,
     )
 
 
@@ -1450,6 +1516,8 @@ def run_client(
     speculative_config: SpeculativeConfig,
     smoothing_config: ActionSmoothingConfig,
     log_row_execution: bool,
+    image_transport: ImageTransportMode,
+    image_jpeg_quality: int,
 ) -> None:
     logging.info("Connecting to AgiBot server at %s:%s...", host, port)
     client = WebsocketClientPolicy(host=host, port=port)
@@ -1492,7 +1560,7 @@ def run_client(
     action_records: list[dict[str, object]] = []
     logging.info("Starting live client, session_id=%s", session_id)
     logging.info(
-        "Client config: sdk_arm_order=%s arm_execution_mode=%s direct_control_hz=%.2f action_smoothing=%s savgol_window=%s savgol_polyorder=%s savgol_upsample=%s apply_actions=%s enable_gripper=%s enable_wheel=%s observation_fps=%.2f observation_interval=%.3fs arm_interval=%.4fs arm_close_timeout=%.2fs obs_flip_left=%s obs_flip_right=%s gripper_threshold=%.2f gripper_close_when_high=%s speculative_enabled=%s log_row_execution=%s action_log_path=%s",
+        "Client config: sdk_arm_order=%s arm_execution_mode=%s direct_control_hz=%.2f action_smoothing=%s savgol_window=%s savgol_polyorder=%s savgol_upsample=%s apply_actions=%s enable_gripper=%s enable_wheel=%s observation_fps=%.2f observation_interval=%.3fs arm_interval=%.4fs arm_close_timeout=%.2fs obs_flip_left=%s obs_flip_right=%s gripper_threshold=%.2f gripper_close_when_high=%s speculative_enabled=%s image_transport=%s image_jpeg_quality=%s log_row_execution=%s action_log_path=%s",
         sdk_arm_order,
         arm_execution_mode,
         limits.direct_control_hz,
@@ -1512,6 +1580,8 @@ def run_client(
         gripper_config.close_threshold,
         gripper_config.close_when_high,
         speculative_config.enabled,
+        image_transport,
+        image_jpeg_quality,
         log_row_execution,
         action_log_path,
     )
@@ -1544,6 +1614,8 @@ def run_client(
                         session_id=session_id,
                         sdk_arm_order=sdk_arm_order,
                         obs_flip_config=obs_flip_config,
+                        image_transport=image_transport,
+                        image_jpeg_quality=image_jpeg_quality,
                     )
                     request = worker.submit(prepared)
                     if request is None:
@@ -1565,7 +1637,10 @@ def run_client(
                 last_used_sequence_latest_sampled_at = prepared.latest_sampled_at
                 latest_sample = prepared.sequence[-1]
                 logging.info(
-                    "Step %s | source=%s action shape=%s horizon=%s range=[%.4f, %.4f] infer_dt=%.3fs obs_sample_interval=%.3fs obs_history_span=%.3fs obs_consumed_interval=%.3fs sampled_at=%.3f history_len=%s latest_camera_ts=[%s,%s,%s]",
+                    "Step %s | source=%s action shape=%s horizon=%s range=[%.4f, %.4f] infer_dt=%.3fs "
+                    "obs_capture=%.3fs obs_raw_payload=%.2fMB obs_tx_payload=%.2fMB image_transport=%s "
+                    "obs_sample_interval=%.3fs obs_history_span=%.3fs "
+                    "obs_consumed_interval=%.3fs sampled_at=%.3f history_len=%s latest_camera_ts=[%s,%s,%s]",
                     step,
                     inference_source,
                     actions.shape,
@@ -1573,6 +1648,10 @@ def run_client(
                     float(actions.min()),
                     float(actions.max()),
                     infer_result.duration_s,
+                    prepared.capture_duration_s,
+                    prepared.obs_image_payload_bytes / (1024 * 1024),
+                    prepared.obs_transmitted_image_payload_bytes / (1024 * 1024),
+                    image_transport,
                     prepared.observation_sample_interval,
                     prepared.observation_history_span,
                     prepared.observation_consumed_interval,
@@ -1629,6 +1708,15 @@ def run_client(
                     "observation_interval_seconds": round(prepared.observation_sample_interval, 6),
                     "observation_history_span_seconds": round(prepared.observation_history_span, 6),
                     "observation_consumed_interval_seconds": round(prepared.observation_consumed_interval, 6),
+                    "observation_capture_duration_seconds": round(prepared.capture_duration_s, 6),
+                    "observation_image_payload_bytes": int(prepared.obs_image_payload_bytes),
+                    "observation_image_payload_mb": round(prepared.obs_image_payload_bytes / (1024 * 1024), 6),
+                    "observation_transmitted_image_payload_bytes": int(prepared.obs_transmitted_image_payload_bytes),
+                    "observation_transmitted_image_payload_mb": round(
+                        prepared.obs_transmitted_image_payload_bytes / (1024 * 1024), 6
+                    ),
+                    "image_transport": image_transport,
+                    "image_jpeg_quality": int(image_jpeg_quality),
                     "observation_head_camera_timestamp": latest_sample.head_ts,
                     "observation_left_camera_timestamp": latest_sample.left_ts,
                     "observation_right_camera_timestamp": latest_sample.right_ts,
@@ -1695,6 +1783,8 @@ def run_client(
                                 session_id=session_id,
                                 sdk_arm_order=sdk_arm_order,
                                 obs_flip_config=obs_flip_config,
+                                image_transport=image_transport,
+                                image_jpeg_quality=image_jpeg_quality,
                             )
                         except Exception as exc:
                             logging.warning("Failed to capture speculative observation at row %s/%s: %s", row_done, row_total, exc)
@@ -1993,6 +2083,18 @@ def main() -> None:
         help="Number of most recent real camera samples to stack into each observation.",
     )
     parser.add_argument(
+        "--image-transport",
+        choices=["raw", "jpeg"],
+        default="raw",
+        help="How to send camera observations to the server. JPEG greatly reduces websocket payload size.",
+    )
+    parser.add_argument(
+        "--image-jpeg-quality",
+        type=int,
+        default=80,
+        help="JPEG quality used when --image-transport=jpeg.",
+    )
+    parser.add_argument(
         "--enable-speculative-inference",
         action="store_true",
         help="Run next-step inference in the background during current chunk execution and only accept it at the chunk boundary if the robot state is still close.",
@@ -2153,6 +2255,8 @@ def main() -> None:
             upsample=args.savgol_upsample,
         ),
         log_row_execution=args.log_row_execution,
+        image_transport=args.image_transport,
+        image_jpeg_quality=args.image_jpeg_quality,
     )
 
 
