@@ -55,6 +55,7 @@ ArmOrder = Literal["left_right", "right_left"]
 ArmExecutionMode = Literal["ruckig", "direct-48"]
 ActionSmoothingMode = Literal["none", "savgol"]
 ImageTransportMode = Literal["raw", "jpeg"]
+VideoLayout = Literal["agibot_grid", "horizontal"]
 DEFAULT_SDK_ARM_ORDER: ArmOrder = "left_right"
 ARM_JOINT_COUNT = 14
 RIGHT_ARM_START = 7
@@ -134,6 +135,7 @@ class PreparedObservation:
     arm_pos_policy: np.ndarray
     obs_arm_policy: np.ndarray
     head_pos: np.ndarray
+    obs_head_policy: np.ndarray
     waist_pos: np.ndarray
     gripper_pos_sdk: np.ndarray
     obs_gripper_policy: np.ndarray
@@ -278,6 +280,165 @@ class _ObservationSampler:
             now = time.monotonic()
             if next_sample_time < now - self._interval_s:
                 next_sample_time = now + self._interval_s
+
+
+def _resize_to_match(frame: np.ndarray, width: int, height: int) -> np.ndarray:
+    if frame.shape[1] == width and frame.shape[0] == height:
+        return frame
+    return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+
+
+def _compose_three_view_frame(
+    head_img: np.ndarray,
+    left_img: np.ndarray,
+    right_img: np.ndarray,
+    *,
+    layout: VideoLayout,
+) -> np.ndarray:
+    height, width = head_img.shape[:2]
+    left_img = _resize_to_match(left_img, width, height)
+    right_img = _resize_to_match(right_img, width, height)
+
+    if layout == "horizontal":
+        return np.concatenate([head_img, left_img, right_img], axis=1)
+    if layout == "agibot_grid":
+        black = np.zeros_like(head_img)
+        top = np.concatenate([head_img, right_img], axis=1)
+        bottom = np.concatenate([left_img, black], axis=1)
+        return np.concatenate([top, bottom], axis=0)
+    raise ValueError(f"Unsupported video layout: {layout}")
+
+
+def _prepare_mp4_frame(frame: np.ndarray) -> np.ndarray:
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+    elif frame.ndim == 3 and frame.shape[2] == 4:
+        frame = frame[:, :, :3]
+    elif frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError(f"Expected video frame shape HxWx3, got {frame.shape}")
+
+    if frame.dtype != np.uint8:
+        frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+    height, width = frame.shape[:2]
+    even_height = height - (height % 2)
+    even_width = width - (width % 2)
+    if even_height <= 0 or even_width <= 0:
+        raise ValueError(f"Video frame is too small for mp4 encoding: {frame.shape}")
+    if even_height != height or even_width != width:
+        frame = frame[:even_height, :even_width]
+
+    return np.ascontiguousarray(frame)
+
+
+class _TaskVideoRecorder:
+    """Record live three-camera task execution into one comparison video."""
+
+    def __init__(
+        self,
+        *,
+        sampler: _ObservationSampler,
+        output_path: str,
+        fps: float,
+        layout: VideoLayout,
+        target_w: int | None,
+        target_h: int | None,
+    ) -> None:
+        if fps <= 0:
+            raise ValueError(f"Recording fps must be positive, got {fps}")
+        self._sampler = sampler
+        self._output_path = output_path
+        self._fps = float(fps)
+        self._layout = layout
+        self._target_w = target_w
+        self._target_h = target_h
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._frames_written = 0
+        self._error: BaseException | None = None
+
+    @property
+    def frames_written(self) -> int:
+        return self._frames_written
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        output_dir = os.path.dirname(self._output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        self._thread = threading.Thread(target=self._run, name="task-video-recorder")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=30.0)
+            if self._thread.is_alive():
+                raise RuntimeError(
+                    "Task video recorder did not stop within 30s; mp4 may not have been finalized."
+                )
+            self._thread = None
+        if self._error is not None:
+            raise RuntimeError(f"Task video recorder failed: {self._error}") from self._error
+        if self._frames_written <= 0:
+            raise RuntimeError(
+                "Task video recorder stopped without writing any frames. "
+                "The mp4 file is empty because no sampled camera frame was available."
+            )
+
+    def _resize_if_needed(self, image: np.ndarray) -> np.ndarray:
+        if self._target_w is None or self._target_h is None:
+            return image
+        return cv2.resize(image, (self._target_w, self._target_h), interpolation=cv2.INTER_AREA)
+
+    def _run(self) -> None:
+        import imageio
+
+        writer = None
+        interval_s = 1.0 / self._fps
+        next_frame_time = time.monotonic()
+        try:
+            writer = imageio.get_writer(
+                self._output_path,
+                fps=self._fps,
+                codec="libx264",
+                macro_block_size=1,
+                pixelformat="yuv420p",
+                output_params=["-movflags", "+faststart"],
+            )
+            while not self._stop_event.is_set():
+                now = time.monotonic()
+                sleep_s = next_frame_time - now
+                if sleep_s > 0 and self._stop_event.wait(timeout=sleep_s):
+                    break
+
+                sample = self._sampler.get_latest_sample()
+                if sample is None:
+                    logging.warning("Task video recorder has no sampled observation yet; skipping frame.")
+                else:
+                    frame = _compose_three_view_frame(
+                        self._resize_if_needed(sample.head_img),
+                        self._resize_if_needed(sample.left_img),
+                        self._resize_if_needed(sample.right_img),
+                        layout=self._layout,
+                    )
+                    writer.append_data(_prepare_mp4_frame(frame))
+                    self._frames_written += 1
+
+                next_frame_time += interval_s
+                now = time.monotonic()
+                if next_frame_time < now - interval_s:
+                    next_frame_time = now + interval_s
+        except BaseException as exc:
+            self._error = exc
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except BaseException as exc:
+                    if self._error is None:
+                        self._error = exc
 
 
 class _InferenceWorker:
@@ -562,6 +723,8 @@ def _build_obs(
 @dataclass
 class Limits:
     arm_delta: float
+    arm_velocity: float
+    arm_acceleration: float
     head_delta: float
     waist_pitch_delta: float
     waist_lift_delta: float
@@ -643,6 +806,23 @@ def _is_finite_vector(values: np.ndarray | list[float]) -> bool:
     return bool(np.all(np.isfinite(arr)))
 
 
+def _send_limited_head_action(robot: Robot, head_target: np.ndarray, limits: Limits) -> np.ndarray:
+    target = np.asarray(head_target, dtype=np.float32).reshape(-1)
+    if target.shape[0] != 2:
+        raise RuntimeError(f"head action length must be 2, got {target.shape[0]}")
+    if not _is_finite_vector(target):
+        raise RuntimeError(f"head action contains non-finite values: {target.tolist()}")
+
+    head_cur, _ = robot.head_joint_states()
+    head_cur = _angles_to_policy_radians(head_cur)
+    if head_cur.shape[0] != 2:
+        raise RuntimeError(f"head_joint_states length must be 2, got {head_cur.shape[0]}")
+
+    safe_head = _clip_delta(target, head_cur, limits.head_delta).astype(np.float32)
+    robot.move_head(safe_head.tolist())
+    return safe_head
+
+
 def _sleep_with_stop(duration_s: float, should_stop: Callable[[], bool]) -> None:
     deadline = time.time() + max(duration_s, 0.0)
     while time.time() < deadline:
@@ -700,6 +880,7 @@ def _capture_prepared_observation(
     gripper_pos_sdk = np.asarray(gripper_pos, dtype=np.float32)
     obs_gripper_policy = _sdk_gripper_to_policy_obs(gripper_pos_sdk)
     head_pos_arr = np.asarray(head_pos, dtype=np.float32)
+    obs_head_policy = _angles_to_policy_radians(head_pos_arr)
     waist_pos_arr = np.asarray(waist_pos, dtype=np.float32)
 
     obs = _build_obs(
@@ -736,6 +917,7 @@ def _capture_prepared_observation(
         arm_pos_policy=arm_pos_policy,
         obs_arm_policy=obs_arm_policy,
         head_pos=head_pos_arr,
+        obs_head_policy=obs_head_policy,
         waist_pos=waist_pos_arr,
         gripper_pos_sdk=gripper_pos_sdk,
         obs_gripper_policy=obs_gripper_policy,
@@ -754,7 +936,8 @@ def _read_policy_robot_state(robot: Robot, sdk_arm_order: ArmOrder) -> dict[str,
     return {
         "arm_policy": _sdk_to_policy_arm(np.asarray(arm_pos, dtype=np.float32), sdk_arm_order),
         "waist": np.asarray(waist_pos, dtype=np.float32),
-        "head": np.asarray(head_pos, dtype=np.float32),
+        "head_raw": np.asarray(head_pos, dtype=np.float32),
+        "head_policy": _angles_to_policy_radians(head_pos),
         "gripper_sdk": np.asarray(gripper_pos, dtype=np.float32),
     }
 
@@ -770,7 +953,7 @@ def _evaluate_speculative_result(
     prepared = result.request.prepared
     arm_delta_max = float(np.max(np.abs(boundary_state["arm_policy"] - prepared.arm_pos_policy)))
     waist_delta_max = float(np.max(np.abs(boundary_state["waist"] - prepared.waist_pos)))
-    head_delta_max = float(np.max(np.abs(boundary_state["head"] - prepared.head_pos)))
+    head_delta_max = float(np.max(np.abs(boundary_state["head_policy"] - prepared.obs_head_policy)))
     gripper_delta_max = float(np.max(np.abs(boundary_state["gripper_sdk"] - prepared.gripper_pos_sdk)))
     state_age_s = float(time.time() - prepared.captured_at)
 
@@ -796,7 +979,8 @@ def _evaluate_speculative_result(
         "state_age_s": state_age_s,
         "boundary_arm_policy": boundary_state["arm_policy"],
         "boundary_waist": boundary_state["waist"],
-        "boundary_head": boundary_state["head"],
+        "boundary_head_raw": boundary_state["head_raw"],
+        "boundary_head_policy": boundary_state["head_policy"],
         "boundary_gripper_sdk": boundary_state["gripper_sdk"],
     }
 
@@ -946,7 +1130,9 @@ def _make_row_execution_record(
     safe_wheel: np.ndarray | None,
     row_gripper_policy: np.ndarray,
     row_gripper_sdk: np.ndarray,
+    safe_head: np.ndarray | None,
     arm_points_sent_this_row: int,
+    head_sent: bool,
     waist_sent: bool,
     wheel_sent: bool,
     gripper_sent: bool,
@@ -965,6 +1151,9 @@ def _make_row_execution_record(
         "gripper_command_policy": np.asarray(row_gripper_policy, dtype=np.float32).tolist(),
         "gripper_command_sdk": np.asarray(row_gripper_sdk, dtype=np.float32).tolist(),
         "gripper_sent": bool(gripper_sent),
+        "raw_head_target": np.asarray(row_parts["head"], dtype=np.float32).tolist(),
+        "safe_head_target_policy": [] if safe_head is None else np.asarray(safe_head, dtype=np.float32).tolist(),
+        "head_sent": bool(head_sent),
         "raw_waist_target": np.asarray(row_parts["waist"], dtype=np.float32).tolist(),
         "safe_waist_target_policy": [] if safe_waist is None else np.asarray(safe_waist, dtype=np.float32).tolist(),
         "safe_waist_target_sdk": [] if safe_waist is None else _policy_waist_to_sdk(safe_waist).tolist(),
@@ -979,6 +1168,7 @@ def _build_safe_arm_targets(
     actions: np.ndarray,
     current_policy_arm: np.ndarray,
     limits: Limits,
+    row_interval_s: float | None = None,
 ) -> np.ndarray:
     arr = np.asarray(actions, dtype=np.float32)
     if arr.ndim != 2 or arr.shape[1] < ARM_JOINT_COUNT:
@@ -986,9 +1176,30 @@ def _build_safe_arm_targets(
 
     safe_rows: list[np.ndarray] = []
     previous = np.asarray(current_policy_arm, dtype=np.float32)
+    previous_velocity = np.zeros(ARM_JOINT_COUNT, dtype=np.float32)
+    dt = None if row_interval_s is None else max(float(row_interval_s), 1e-6)
     for row in arr:
         target_arm = row[:ARM_JOINT_COUNT].astype(np.float32)
-        safe_row = _clip_delta(target_arm, previous[:ARM_JOINT_COUNT], limits.arm_delta).astype(np.float32)
+        if dt is None:
+            safe_row = _clip_delta(target_arm, previous[:ARM_JOINT_COUNT], limits.arm_delta).astype(np.float32)
+        else:
+            desired_velocity = (target_arm - previous[:ARM_JOINT_COUNT]) / dt
+            if limits.arm_acceleration > 0.0:
+                max_velocity_delta = limits.arm_acceleration * dt
+                desired_velocity = np.clip(
+                    desired_velocity,
+                    previous_velocity - max_velocity_delta,
+                    previous_velocity + max_velocity_delta,
+                )
+            if limits.arm_velocity > 0.0:
+                desired_velocity = np.clip(desired_velocity, -limits.arm_velocity, limits.arm_velocity)
+            step = desired_velocity * dt
+            step_limit = limits.arm_delta
+            if limits.arm_velocity > 0.0:
+                step_limit = min(step_limit, limits.arm_velocity * dt)
+            step = np.clip(step, -step_limit, step_limit)
+            safe_row = (previous[:ARM_JOINT_COUNT] + step).astype(np.float32)
+            previous_velocity = (safe_row - previous[:ARM_JOINT_COUNT]) / dt
         safe_rows.append(safe_row)
         previous = safe_row
     return np.stack(safe_rows, axis=0)
@@ -1030,13 +1241,14 @@ def _build_segment_trajectory(
 def _build_move_arm_points(
     safe_policy_targets: np.ndarray,
     sdk_arm_order: ArmOrder,
+    interval_s: float = DEFAULT_MOVE_ARM_INTERVAL_S,
 ) -> list[list[float]]:
     points: list[list[float]] = []
     prev_sdk = _policy_to_sdk_arm(safe_policy_targets[0], sdk_arm_order)
     points.append(prev_sdk.astype(np.float32).tolist())
     for row in safe_policy_targets[1:]:
         target_sdk = _policy_to_sdk_arm(row, sdk_arm_order)
-        segment = _build_segment_trajectory(prev_sdk, target_sdk)
+        segment = _build_segment_trajectory(prev_sdk, target_sdk, interval_s)
         if points and segment:
             segment = segment[1:]
         points.extend([list(np.asarray(p, dtype=np.float32)) for p in segment])
@@ -1109,10 +1321,13 @@ def _execute_arm_trajectory(
     wheel_rows_sent = 0
     wheel_stop_sent = False
     gripper_updates = 0
+    head_rows_sent = 0
     first_waist_sent: np.ndarray | None = None
     last_waist_sent: np.ndarray | None = None
     first_wheel_sent: np.ndarray | None = None
     last_wheel_sent: np.ndarray | None = None
+    first_head_sent: np.ndarray | None = None
+    last_head_sent: np.ndarray | None = None
     first_gripper_sent_policy: np.ndarray | None = None
     last_gripper_sent_policy: np.ndarray | None = None
 
@@ -1150,10 +1365,22 @@ def _execute_arm_trajectory(
             _sleep_with_stop(limits.arm_trajectory_interval, should_stop)
 
         row_parts = _parse_action_row(arr[row_index], arr.shape[0])
+        safe_head: np.ndarray | None = None
         safe_waist: np.ndarray | None = None
         safe_wheel: np.ndarray | None = None
+        head_sent = False
         waist_sent = False
         wheel_sent = False
+
+        head_target = row_parts["head"].astype(np.float32)
+        if _is_finite_vector(head_target):
+            safe_head = _send_limited_head_action(robot, head_target, limits)
+            _mark_command_sent()
+            head_rows_sent += 1
+            head_sent = True
+            if first_head_sent is None:
+                first_head_sent = safe_head
+            last_head_sent = safe_head
 
         waist_target = row_parts["waist"].astype(np.float32)
         if _is_finite_vector(waist_target):
@@ -1215,7 +1442,9 @@ def _execute_arm_trajectory(
                     safe_wheel=safe_wheel,
                     row_gripper_policy=row_gripper_policy,
                     row_gripper_sdk=row_gripper_sdk,
+                    safe_head=safe_head,
                     arm_points_sent_this_row=move_arm_points - arm_points_before_row,
+                    head_sent=head_sent,
                     waist_sent=waist_sent,
                     wheel_sent=wheel_sent,
                     gripper_sent=gripper_sent,
@@ -1253,6 +1482,9 @@ def _execute_arm_trajectory(
         "wheel_rows_sent": np.asarray([wheel_rows_sent], dtype=np.int32),
         "wheel_stop_sent": np.asarray([int(wheel_stop_sent)], dtype=np.int32),
         "gripper_updates": np.asarray([gripper_updates], dtype=np.int32),
+        "head_rows_sent": np.asarray([head_rows_sent], dtype=np.int32),
+        "first_head_sent": np.zeros(2, dtype=np.float32) if first_head_sent is None else first_head_sent,
+        "last_head_sent": np.zeros(2, dtype=np.float32) if last_head_sent is None else last_head_sent,
         "first_waist_sent": np.zeros(2, dtype=np.float32) if first_waist_sent is None else first_waist_sent,
         "last_waist_sent": np.zeros(2, dtype=np.float32) if last_waist_sent is None else last_waist_sent,
         "first_wheel_sent": np.zeros(2, dtype=np.float32) if first_wheel_sent is None else first_wheel_sent,
@@ -1299,17 +1531,21 @@ def _execute_arm_direct48(
     arm_cur, _ = robot.arm_joint_states()
     arm_cur_sdk = np.asarray(arm_cur, dtype=np.float32)
     arm_cur_policy = _sdk_to_policy_arm(arm_cur_sdk, sdk_arm_order)
-    safe_policy_targets = _build_safe_arm_targets(actions, arm_cur_policy, limits)
+    row_interval_s = 1.0 / max(limits.direct_control_hz, 1e-6)
+    safe_policy_targets = _build_safe_arm_targets(actions, arm_cur_policy, limits, row_interval_s=row_interval_s)
 
     move_arm_points = 0
     waist_rows_sent = 0
     wheel_rows_sent = 0
     wheel_stop_sent = False
     gripper_updates = 0
+    head_rows_sent = 0
     first_waist_sent: np.ndarray | None = None
     last_waist_sent: np.ndarray | None = None
     first_wheel_sent: np.ndarray | None = None
     last_wheel_sent: np.ndarray | None = None
+    first_head_sent: np.ndarray | None = None
+    last_head_sent: np.ndarray | None = None
     first_gripper_sent_policy: np.ndarray | None = None
     last_gripper_sent_policy: np.ndarray | None = None
     last_gripper_sent_sdk: np.ndarray | None = None
@@ -1317,7 +1553,6 @@ def _execute_arm_direct48(
     total_rows = safe_policy_targets.shape[0]
     trigger_row = min(total_rows, max(1, int(np.ceil(total_rows * min(max(prefetch_fraction, 0.0), 1.0)))))
     prefetch_triggered = False
-    row_interval_s = 1.0 / max(limits.direct_control_hz, 1e-6)
     execution_started_at = time.time()
     first_command_at: float | None = None
     row_execution_log: list[dict[str, object]] = []
@@ -1339,10 +1574,22 @@ def _execute_arm_direct48(
         move_arm_points += 1
 
         row_parts = _parse_action_row(arr[row_index], arr.shape[0])
+        safe_head: np.ndarray | None = None
         safe_waist: np.ndarray | None = None
         safe_wheel: np.ndarray | None = None
+        head_sent = False
         waist_sent = False
         wheel_sent = False
+
+        head_target = row_parts["head"].astype(np.float32)
+        if _is_finite_vector(head_target):
+            safe_head = _send_limited_head_action(robot, head_target, limits)
+            _mark_command_sent()
+            head_rows_sent += 1
+            head_sent = True
+            if first_head_sent is None:
+                first_head_sent = safe_head
+            last_head_sent = safe_head
 
         waist_target = row_parts["waist"].astype(np.float32)
         if _is_finite_vector(waist_target):
@@ -1404,7 +1651,9 @@ def _execute_arm_direct48(
                     safe_wheel=safe_wheel,
                     row_gripper_policy=row_gripper_policy,
                     row_gripper_sdk=row_gripper_sdk,
+                    safe_head=safe_head,
                     arm_points_sent_this_row=move_arm_points - arm_points_before_row,
+                    head_sent=head_sent,
                     waist_sent=waist_sent,
                     wheel_sent=wheel_sent,
                     gripper_sent=gripper_sent,
@@ -1444,6 +1693,9 @@ def _execute_arm_direct48(
         "wheel_rows_sent": np.asarray([wheel_rows_sent], dtype=np.int32),
         "wheel_stop_sent": np.asarray([int(wheel_stop_sent)], dtype=np.int32),
         "gripper_updates": np.asarray([gripper_updates], dtype=np.int32),
+        "head_rows_sent": np.asarray([head_rows_sent], dtype=np.int32),
+        "first_head_sent": np.zeros(2, dtype=np.float32) if first_head_sent is None else first_head_sent,
+        "last_head_sent": np.zeros(2, dtype=np.float32) if last_head_sent is None else last_head_sent,
         "first_waist_sent": np.zeros(2, dtype=np.float32) if first_waist_sent is None else first_waist_sent,
         "last_waist_sent": np.zeros(2, dtype=np.float32) if last_waist_sent is None else last_waist_sent,
         "first_wheel_sent": np.zeros(2, dtype=np.float32) if first_wheel_sent is None else first_wheel_sent,
@@ -1467,26 +1719,6 @@ def _execute_arm_direct48(
         "wait_duration_seconds": wait_result["wait_duration_seconds"],
         "execution_duration_seconds": execution_finished_at - execution_started_at,
         "row_execution_log": row_execution_log,
-    }
-
-
-def _apply_aux_actions(
-    robot: Robot,
-    parsed: dict[str, np.ndarray],
-    limits: Limits,
-) -> dict[str, np.ndarray]:
-    head_cur, _ = robot.head_joint_states()
-
-    head_cur = _angles_to_policy_radians(head_cur)
-    if head_cur.shape[0] != 2:
-        raise RuntimeError(f"head_joint_states length must be 2, got {head_cur.shape[0]}")
-
-    head_target = parsed["head"].astype(np.float32)
-    safe_head = _clip_delta(head_target, head_cur, limits.head_delta)
-    robot.move_head(safe_head.tolist())
-
-    return {
-        "head": safe_head,
     }
 
 
@@ -1518,11 +1750,17 @@ def run_client(
     log_row_execution: bool,
     image_transport: ImageTransportMode,
     image_jpeg_quality: int,
+    record_task_video: bool,
+    record_dir: str,
+    record_fps: float | None,
+    record_layout: VideoLayout,
 ) -> None:
     logging.info("Connecting to AgiBot server at %s:%s...", host, port)
     client = WebsocketClientPolicy(host=host, port=port)
     metadata = client.get_server_metadata()
     logging.info("Server metadata: %s", metadata)
+    generated_video_fps = metadata.get("generated_video_fps")
+    task_video_fps = float(record_fps or generated_video_fps or 20)
     image_resolution = metadata.get("image_resolution")
     if image_resolution is not None:
         target_w, target_h = int(image_resolution[0]), int(image_resolution[1])
@@ -1558,12 +1796,38 @@ def run_client(
     os.makedirs(log_dir, exist_ok=True)
     action_log_path = os.path.join(log_dir, f"agibot_actions_{timestamp}.json")
     action_records: list[dict[str, object]] = []
+    recorder: _TaskVideoRecorder | None = None
+    task_video_path: str | None = None
+    if record_task_video:
+        task_video_dir = os.path.join(record_dir, timestamp)
+        task_video_path = os.path.join(
+            task_video_dir,
+            f"task_execution_{session_id}_{record_layout}_{task_video_fps:g}fps.mp4",
+        )
+        recorder = _TaskVideoRecorder(
+            sampler=sampler,
+            output_path=task_video_path,
+            fps=task_video_fps,
+            layout=record_layout,
+            target_w=target_w,
+            target_h=target_h,
+        )
+        recorder.start()
+        logging.info(
+            "Recording task execution video to %s | fps=%.3f layout=%s",
+            task_video_path,
+            task_video_fps,
+            record_layout,
+        )
     logging.info("Starting live client, session_id=%s", session_id)
     logging.info(
-        "Client config: sdk_arm_order=%s arm_execution_mode=%s direct_control_hz=%.2f action_smoothing=%s savgol_window=%s savgol_polyorder=%s savgol_upsample=%s apply_actions=%s enable_gripper=%s enable_wheel=%s observation_fps=%.2f observation_interval=%.3fs arm_interval=%.4fs arm_close_timeout=%.2fs obs_flip_left=%s obs_flip_right=%s gripper_threshold=%.2f gripper_close_when_high=%s speculative_enabled=%s image_transport=%s image_jpeg_quality=%s log_row_execution=%s action_log_path=%s",
+        "Client config: sdk_arm_order=%s arm_execution_mode=%s direct_control_hz=%.2f arm_delta=%.4f arm_velocity=%.4f arm_acceleration=%.4f action_smoothing=%s savgol_window=%s savgol_polyorder=%s savgol_upsample=%s apply_actions=%s enable_gripper=%s enable_wheel=%s observation_fps=%.2f observation_interval=%.3fs arm_interval=%.4fs arm_close_timeout=%.2fs obs_flip_left=%s obs_flip_right=%s gripper_threshold=%.2f gripper_close_when_high=%s speculative_enabled=%s image_transport=%s image_jpeg_quality=%s log_row_execution=%s record_task_video=%s action_log_path=%s",
         sdk_arm_order,
         arm_execution_mode,
         limits.direct_control_hz,
+        limits.arm_delta,
+        limits.arm_velocity,
+        limits.arm_acceleration,
         smoothing_config.mode,
         smoothing_config.window,
         smoothing_config.polyorder,
@@ -1583,6 +1847,7 @@ def run_client(
         image_transport,
         image_jpeg_quality,
         log_row_execution,
+        record_task_video,
         action_log_path,
     )
     _maybe_warn_sdk_order(sdk_arm_order)
@@ -1674,13 +1939,15 @@ def run_client(
                     np.round(parsed["wheel"], 4).tolist(),
                 )
                 logging.info(
-                    "Arm state sdk_first7[:3]=%s sdk_last7[:3]=%s | raw_policy_left[:3]=%s raw_policy_right[:3]=%s | obs_policy_left[:3]=%s obs_policy_right[:3]=%s | gripper_sdk=%s gripper_obs=%s",
+                    "State sdk_first7[:3]=%s sdk_last7[:3]=%s | raw_policy_left[:3]=%s raw_policy_right[:3]=%s | obs_policy_left[:3]=%s obs_policy_right[:3]=%s | head_raw=%s head_policy=%s | gripper_sdk=%s gripper_obs=%s",
                     np.round(prepared.arm_pos_sdk[:7], 4).tolist(),
                     np.round(prepared.arm_pos_sdk[7:], 4).tolist(),
                     np.round(prepared.arm_pos_policy[:7], 4).tolist(),
                     np.round(prepared.arm_pos_policy[7:], 4).tolist(),
                     np.round(prepared.obs_arm_policy[:7], 4).tolist(),
                     np.round(prepared.obs_arm_policy[7:], 4).tolist(),
+                    np.round(prepared.head_pos, 4).tolist(),
+                    np.round(prepared.obs_head_policy, 4).tolist(),
                     np.round(prepared.gripper_pos_sdk, 4).tolist(),
                     np.round(prepared.obs_gripper_policy, 4).tolist(),
                 )
@@ -1717,6 +1984,10 @@ def run_client(
                     ),
                     "image_transport": image_transport,
                     "image_jpeg_quality": int(image_jpeg_quality),
+                    "record_task_video": bool(record_task_video),
+                    "task_video_path": task_video_path,
+                    "task_video_fps": float(task_video_fps),
+                    "task_video_layout": record_layout,
                     "observation_head_camera_timestamp": latest_sample.head_ts,
                     "observation_left_camera_timestamp": latest_sample.left_ts,
                     "observation_right_camera_timestamp": latest_sample.right_ts,
@@ -1729,6 +2000,9 @@ def run_client(
                     "sdk_execution_arm_order": sdk_arm_order,
                     "arm_execution_mode": arm_execution_mode,
                     "direct_control_hz": float(limits.direct_control_hz),
+                    "arm_delta_limit": float(limits.arm_delta),
+                    "arm_velocity_limit": float(limits.arm_velocity),
+                    "arm_acceleration_limit": float(limits.arm_acceleration),
                     "action_smoothing": smoothing_config.mode,
                     "action_smoothing_duration_seconds": round(smoothing_duration_s, 6),
                     "savgol_window": int(smoothing_config.window),
@@ -1747,6 +2021,7 @@ def run_client(
                     "policy_right_arm_joint_position": prepared.arm_pos_policy[7:].tolist(),
                     "obs_left_arm_joint_position": prepared.obs_arm_policy[:7].tolist(),
                     "obs_right_arm_joint_position": prepared.obs_arm_policy[7:].tolist(),
+                    "obs_head_policy_position": prepared.obs_head_policy.tolist(),
                     "obs_gripper_policy_position": prepared.obs_gripper_policy.tolist(),
                     "predicted_first_left_arm_joint_position": parsed["left_arm"].tolist(),
                     "predicted_first_right_arm_joint_position": parsed["right_arm"].tolist(),
@@ -1842,18 +2117,15 @@ def run_client(
                         break
                     trajectory_returned_at = time.time()
                     aux_started_at = time.time()
-                    aux = _apply_aux_actions(
-                        robot=robot,
-                        parsed=parsed,
-                        limits=limits,
-                    )
-                    aux_finished_at = time.time()
+                    aux = {"head": trajectory["last_head_sent"]}
+                    aux_finished_at = aux_started_at
                     action_to_execution_call_delay_s = execution_call_started_at - action_received_at
                     action_to_first_command_delay_s = float(trajectory["first_command_at"]) - action_received_at
                     logging.info(
-                        "Executed move_arm dual-arm trajectory with row-synced gripper | target_rows=%s move_arm_points=%s waist_rows=%s wheel_rows=%s wheel_stop=%s gripper_updates=%s cur_left[:3]=%s cur_right[:3]=%s first_left[:3]=%s first_right[:3]=%s last_left[:3]=%s last_right[:3]=%s grip_first=%s grip_last=%s head=%s waist_first=%s waist_last=%s wheel_first=%s wheel_last=%s",
+                        "Executed move_arm dual-arm trajectory with row-synced aux actions | target_rows=%s move_arm_points=%s head_rows=%s waist_rows=%s wheel_rows=%s wheel_stop=%s gripper_updates=%s cur_left[:3]=%s cur_right[:3]=%s first_left[:3]=%s first_right[:3]=%s last_left[:3]=%s last_right[:3]=%s grip_first=%s grip_last=%s head_first=%s head_last=%s waist_first=%s waist_last=%s wheel_first=%s wheel_last=%s",
                         int(trajectory["target_rows"][0]),
                         int(trajectory["move_arm_points"][0]),
+                        int(trajectory["head_rows_sent"][0]),
                         int(trajectory["waist_rows_sent"][0]),
                         int(trajectory["wheel_rows_sent"][0]),
                         bool(int(trajectory["wheel_stop_sent"][0])),
@@ -1866,14 +2138,15 @@ def run_client(
                         np.round(trajectory["last_arm_policy"][7:10], 4).tolist(),
                         np.round(trajectory["first_gripper_sent_policy"], 4).tolist(),
                         np.round(trajectory["last_gripper_sent_policy"], 4).tolist(),
-                        np.round(aux["head"], 4).tolist(),
+                        np.round(trajectory["first_head_sent"], 4).tolist(),
+                        np.round(trajectory["last_head_sent"], 4).tolist(),
                         np.round(trajectory["first_waist_sent"], 4).tolist(),
                         np.round(trajectory["last_waist_sent"], 4).tolist(),
                         np.round(trajectory["first_wheel_sent"], 4).tolist(),
                         np.round(trajectory["last_wheel_sent"], 4).tolist(),
                     )
                     logging.info(
-                        "Timing | infer_dt=%.3fs action_to_exec_call=%.3fs action_to_first_cmd=%.3fs stream=%.3fs wait_close=%.3fs chunk_exec=%.3fs aux=%.3fs total_after_action=%.3fs",
+                        "Timing | infer_dt=%.3fs action_to_exec_call=%.3fs action_to_first_cmd=%.3fs stream=%.3fs wait_close=%.3fs chunk_exec=%.3fs post_aux=%.3fs total_after_action=%.3fs",
                         infer_result.duration_s,
                         action_to_execution_call_delay_s,
                         action_to_first_command_delay_s,
@@ -1978,6 +2251,9 @@ def run_client(
                             "trajectory_gripper_updates": int(trajectory["gripper_updates"][0]),
                             "trajectory_first_gripper_command_policy": trajectory["first_gripper_sent_policy"].tolist(),
                             "trajectory_last_gripper_command_policy": trajectory["last_gripper_sent_policy"].tolist(),
+                            "trajectory_head_rows_sent": int(trajectory["head_rows_sent"][0]),
+                            "trajectory_first_head_position": trajectory["first_head_sent"].tolist(),
+                            "trajectory_last_head_position": trajectory["last_head_sent"].tolist(),
                             "execution_call_started_at_seconds": round(execution_call_started_at, 6),
                             "first_robot_command_at_seconds": round(float(trajectory["first_command_at"]), 6),
                             "trajectory_stream_finished_at_seconds": round(float(trajectory["stream_finished_at"]), 6),
@@ -2028,6 +2304,19 @@ def run_client(
 
                 step += 1
     finally:
+        try:
+            if recorder is not None:
+                logging.info("Stopping task video recorder...")
+                recorder.stop()
+                logging.info(
+                    "Task video saved to %s (%s frames at %.3f fps)",
+                    task_video_path,
+                    recorder.frames_written,
+                    task_video_fps,
+                )
+        except Exception as exc:
+            logging.warning("Failed while stopping task video recorder: %s", exc)
+
         try:
             logging.info("Stopping inference worker...")
             worker.stop()
@@ -2144,6 +2433,18 @@ def main() -> None:
         help="Interpret low gripper logits/targets as close instead of high values as close.",
     )
     parser.add_argument("--arm-delta-limit", type=float, default=0.08)
+    parser.add_argument(
+        "--arm-velocity-limit",
+        type=float,
+        default=0.60,
+        help="Max direct-48 arm joint velocity in rad/s. Set <=0 to disable velocity limiting.",
+    )
+    parser.add_argument(
+        "--arm-acceleration-limit",
+        type=float,
+        default=1.20,
+        help="Max direct-48 arm joint acceleration in rad/s^2. Set <=0 to disable acceleration limiting.",
+    )
     parser.add_argument("--head-delta-limit", type=float, default=0.15)
     parser.add_argument("--waist-pitch-delta-limit", type=float, default=0.10)
     parser.add_argument("--waist-lift-delta-limit", type=float, default=2.0)
@@ -2189,6 +2490,28 @@ def main() -> None:
         help="Record per-row command targets and send timing in the action JSON log. Does not read robot state per row.",
     )
     parser.add_argument(
+        "--record-task-video",
+        action="store_true",
+        help="Record the live three-camera task stream to an mp4 file.",
+    )
+    parser.add_argument(
+        "--record-dir",
+        default="./robot_videos",
+        help="Directory for --record-task-video mp4 outputs.",
+    )
+    parser.add_argument(
+        "--record-fps",
+        type=float,
+        default=None,
+        help="FPS for --record-task-video. Defaults to server generated_video_fps, then 20.",
+    )
+    parser.add_argument(
+        "--record-layout",
+        choices=["agibot_grid", "horizontal"],
+        default="agibot_grid",
+        help="Three-camera layout for --record-task-video.",
+    )
+    parser.add_argument(
         "--sdk-arm-order",
         choices=["left_right", "right_left"],
         default=DEFAULT_SDK_ARM_ORDER,
@@ -2209,6 +2532,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     limits = Limits(
         arm_delta=args.arm_delta_limit,
+        arm_velocity=args.arm_velocity_limit,
+        arm_acceleration=args.arm_acceleration_limit,
         head_delta=args.head_delta_limit,
         waist_pitch_delta=args.waist_pitch_delta_limit,
         waist_lift_delta=args.waist_lift_delta_limit,
@@ -2257,6 +2582,10 @@ def main() -> None:
         log_row_execution=args.log_row_execution,
         image_transport=args.image_transport,
         image_jpeg_quality=args.image_jpeg_quality,
+        record_task_video=args.record_task_video,
+        record_dir=args.record_dir,
+        record_fps=args.record_fps,
+        record_layout=args.record_layout,
     )
 
 
