@@ -53,6 +53,8 @@ class Args:
     port: int = 8000
     timeout_seconds: int = 50000  # 10 hours default, configurable
     model_path: str = "./checkpoints/dreamzero"
+    wan_ckpt_dir: str | None = None  # Override Wan2.1 component paths stored in config.json.
+    tokenizer_path: str | None = None  # Override tokenizer_path stored in experiment_cfg/conf.yaml.
     enable_dit_cache: bool = False  # Backward-compatible alias for num_dit_steps=8.
     num_dit_steps: int | None = None  # Actual DiT compute steps. Supported fast masks: 5, 6, 7, 8. None keeps model default.
     num_inference_timesteps: int | None = None  # Positive values override diffusion steps; 0 keeps checkpoint default.
@@ -60,6 +62,7 @@ class Args:
     embodiment_tag: str = "oxe_droid"
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
     video_save_mode: str = "first"  # one of: none, first, full. Controls generated video saved on reset/client close.
+    output_dir: str = "/data/wangk/dreamzero/video_rollout"
 
 
 class DistributedRoboarenaPolicyBase:
@@ -116,7 +119,7 @@ class DistributedRoboarenaPolicyBase:
         size_tensor = torch.tensor([data_size], dtype=torch.int64, device='cuda')
         dist.broadcast(size_tensor, src=0)
 
-        data_tensor = torch.frombuffer(serialized, dtype=torch.uint8).cuda()
+        data_tensor = torch.frombuffer(serialized, dtype=torch.uint8).clone().cuda()
         dist.broadcast(data_tensor, src=0)
 
     def _extract_action_dict(self, action_chunk_dict: object) -> dict[str, object]:
@@ -553,7 +556,7 @@ class WebsocketPolicyServer:
         size_tensor = torch.tensor([data_size], dtype=torch.int64, device='cuda')
         dist.broadcast(size_tensor, src=0)
 
-        data_tensor = torch.frombuffer(serialized, dtype=torch.uint8).cuda()
+        data_tensor = torch.frombuffer(serialized, dtype=torch.uint8).clone().cuda()
         dist.broadcast(data_tensor, src=0)
 
     async def _handler(self, websocket: _server.ServerConnection):
@@ -694,6 +697,47 @@ def _create_server_config(embodiment_tag: str) -> PolicyServerConfig:
     raise ValueError(f'Unsupported embodiment_tag: {embodiment_tag}')
 
 
+def _build_path_overrides(args: Args) -> tuple[list[str], list[str]]:
+    model_config_overrides: list[str] = []
+    train_config_overrides: list[str] = []
+
+    if args.wan_ckpt_dir:
+        wan_ckpt_dir = os.path.abspath(args.wan_ckpt_dir)
+        required_files = [
+            os.path.join(wan_ckpt_dir, "models_t5_umt5-xxl-enc-bf16.pth"),
+            os.path.join(wan_ckpt_dir, "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"),
+            os.path.join(wan_ckpt_dir, "Wan2.1_VAE.pth"),
+        ]
+        missing = [path for path in required_files if not os.path.exists(path)]
+        if missing:
+            raise FileNotFoundError(
+                "Missing Wan checkpoint component(s): " + ", ".join(missing)
+            )
+        model_config_overrides.extend(
+            [
+                f"action_head_cfg.config.diffusion_model_cfg.diffusion_model_pretrained_path={wan_ckpt_dir}",
+                f"action_head_cfg.config.text_encoder_cfg.text_encoder_pretrained_path={wan_ckpt_dir}/models_t5_umt5-xxl-enc-bf16.pth",
+                f"action_head_cfg.config.image_encoder_cfg.image_encoder_pretrained_path={wan_ckpt_dir}/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+                f"action_head_cfg.config.vae_cfg.vae_pretrained_path={wan_ckpt_dir}/Wan2.1_VAE.pth",
+            ]
+        )
+
+    if args.tokenizer_path:
+        tokenizer_path = os.path.abspath(args.tokenizer_path)
+        if not os.path.exists(tokenizer_path):
+            raise FileNotFoundError(f"Tokenizer path does not exist: {tokenizer_path}")
+        if args.embodiment_tag.lower() == "agibot":
+            train_config_overrides.append(
+                f"transforms.agibot.transforms.10.tokenizer_path={tokenizer_path}"
+            )
+        elif args.embodiment_tag.lower() == "oxe_droid":
+            train_config_overrides.append(
+                f"transforms.oxe_droid.transforms.10.tokenizer_path={tokenizer_path}"
+            )
+
+    return model_config_overrides, train_config_overrides
+
+
 def main(args: Args) -> None:
     os.environ["ENABLE_DIT_CACHE"] = "true" if args.enable_dit_cache else "false"
     if args.num_dit_steps is not None:
@@ -709,10 +753,13 @@ def main(args: Args) -> None:
     if embodiment_tag not in {'oxe_droid', 'agibot'}:
         raise ValueError(f'Unsupported embodiment_tag: {args.embodiment_tag}')
     model_path = args.model_path
+    model_config_overrides, train_config_overrides = _build_path_overrides(args)
     policy_metadata = {
         "embodiment": embodiment_tag,
         "model_name": "dreamzero",
         "model_path": model_path,
+        "wan_ckpt_dir": args.wan_ckpt_dir,
+        "tokenizer_path": args.tokenizer_path,
     }
 
     device_mesh = init_mesh()
@@ -727,6 +774,8 @@ def main(args: Args) -> None:
         model_path=model_path,
         device="cuda" if torch.cuda.is_available() else "cpu",
         device_mesh=device_mesh,
+        model_config_overrides=model_config_overrides,
+        train_config_overrides=train_config_overrides,
     )
     action_head = policy.trained_model.action_head
     if args.num_inference_timesteps is not None:
@@ -764,9 +813,12 @@ def main(args: Args) -> None:
 
     if rank == 0:
         logging.info("Creating server (host: %s, ip: %s)", hostname, local_ip)
-        output_dir = "/home/user/wangk/dreamzero/video_rollout"
-        os.makedirs(output_dir, exist_ok=True)
-        logging.info("Videos will be saved to: %s", output_dir)
+        output_dir = None if args.video_save_mode == "none" else args.output_dir
+        if output_dir is not None:
+            os.makedirs(output_dir, exist_ok=True)
+            logging.info("Videos will be saved to: %s", output_dir)
+        else:
+            logging.info("Video saving disabled; no output directory will be created.")
     else:
         output_dir = None
         logging.info(f"Rank {rank} starting as worker for distributed inference...")
@@ -803,7 +855,10 @@ def main(args: Args) -> None:
         asyncio.run(server._worker_loop())
 
 
-if __name__ == "__main__":
+def cli() -> None:
     logging.basicConfig(level=logging.INFO, force=True)
-    args = tyro.cli(Args)
-    main(args)
+    main(tyro.cli(Args))
+
+
+if __name__ == "__main__":
+    cli()

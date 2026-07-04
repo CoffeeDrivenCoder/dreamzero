@@ -501,8 +501,6 @@ class VLA(PreTrainedModel):
         pretrained_model_name_or_path: str,
         config: VLAConfig = None
     ):
-        del config
-
         from safetensors.torch import load_file
         import os
         import json
@@ -531,14 +529,32 @@ class VLA(PreTrainedModel):
             print(f"Loading weights from safetensors: {safetensors_path}")
             state_dict.update(load_file(safetensors_path))
         
-        # Load config
-        print("loading config@@")
-        config_path = os.path.join(pretrained_model_name_or_path, "config.json")
-        with open(config_path, "r") as f:
-            config_dict = json.load(f)
-        config = VLAConfig(**config_dict)
+        if config is None:
+            print("loading config@@")
+            config_path = os.path.join(pretrained_model_name_or_path, "config.json")
+            with open(config_path, "r") as f:
+                config_dict = json.load(f)
+            config = VLAConfig(**config_dict)
+        elif isinstance(config, dict):
+            config = VLAConfig(**config)
+        else:
+            print("using provided config@@")
         print("loading model")
-        print("config.action_head_cfg", config.action_head_cfg)
+        action_head_inner_cfg = (
+            config.action_head_cfg.get("config", config.action_head_cfg)
+            if isinstance(config.action_head_cfg, dict)
+            else {}
+        )
+        print(
+            "config.action_head summary",
+            {
+                "target": config.action_head_cfg.get("_target_") if isinstance(config.action_head_cfg, dict) else None,
+                "train_architecture": action_head_inner_cfg.get("train_architecture"),
+                "action_horizon": action_head_inner_cfg.get("action_horizon"),
+                "num_inference_timesteps": action_head_inner_cfg.get("num_inference_timesteps"),
+                "diffusion_model_pretrained_path": action_head_inner_cfg.get("diffusion_model_cfg", {}).get("diffusion_model_pretrained_path"),
+            },
+        )
         # Always disable defer_lora_injection
         # config.action_head_cfg is a dict, and defer_lora_injection is nested in config.action_head_cfg['config']
         if 'config' in config.action_head_cfg and isinstance(config.action_head_cfg['config'], dict):
@@ -551,7 +567,7 @@ class VLA(PreTrainedModel):
 
         # Instantiate model
         model = cls(config)
-        print("model", model)
+        print(f"model instantiated: {type(model)}")
         # Remove .base_layer from keys (e.g., 'action_head.model.base_model.model.blocks.19.self_attn.v.base_layer.bias' -> 'action_head.model.base_model.model.blocks.19.self_attn.v.bias')
         has_base_layer = any(".base_layer." in key for key in state_dict.keys())
         if has_base_layer:

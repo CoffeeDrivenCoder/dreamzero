@@ -209,6 +209,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         model_path: str,
         device: int | str,
         model_config_overrides: list[str] | None = [],
+        train_config_overrides: list[str] | None = None,
         skip_assert_delta_indices: bool = False,
         skip_img_transform: bool = False,
         lazy_load: bool = False,
@@ -231,6 +232,9 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         exp_cfg_dir = model_dir / "experiment_cfg"
         train_cfg_path = exp_cfg_dir / "conf.yaml"
         train_cfg = OmegaConf.load(train_cfg_path)
+        if train_config_overrides:
+            print(f"Applying train config overrides: {train_config_overrides}")
+            train_cfg.merge_with_dotlist(list(train_config_overrides))
         self.train_cfg = train_cfg
         self.lazy_load = lazy_load
 
