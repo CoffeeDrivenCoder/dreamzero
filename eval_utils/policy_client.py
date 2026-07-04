@@ -5,6 +5,7 @@ Adapted from https://github.com/robo-arena/roboarena/
 """
 
 import logging
+import inspect
 import time
 from typing import Dict, Tuple
 
@@ -19,6 +20,32 @@ from openpi_client import msgpack_numpy
 # keepalive pings so long-running requests aren't misclassified as dead connections.
 PING_INTERVAL_SECS = None
 PING_TIMEOUT_SECS = None
+
+
+def _connect(uri: str) -> websockets.sync.client.ClientConnection:
+    kwargs = {
+        "compression": None,
+        "max_size": None,
+        "ping_interval": PING_INTERVAL_SECS,
+        "ping_timeout": PING_TIMEOUT_SECS,
+    }
+    try:
+        supported = inspect.signature(websockets.sync.client.connect).parameters
+        kwargs = {key: value for key, value in kwargs.items() if key in supported}
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        return websockets.sync.client.connect(uri, **kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        logging.warning("websockets.connect does not support one of %s; retrying with legacy kwargs.", sorted(kwargs))
+        legacy_kwargs = {key: value for key, value in kwargs.items() if key in {"compression", "max_size"}}
+        try:
+            return websockets.sync.client.connect(uri, **legacy_kwargs)
+        except TypeError:
+            return websockets.sync.client.connect(uri)
 
 
 def _payload_summary(obs: Dict) -> Tuple[int, str]:
@@ -60,26 +87,14 @@ class WebsocketClientPolicy(BasePolicy):
     def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
         logging.info(f"Waiting for server at {self._uri}...")
         try:
-            conn = websockets.sync.client.connect(
-                self._uri, 
-                compression=None, 
-                max_size=None,
-                ping_interval=PING_INTERVAL_SECS,
-                ping_timeout=PING_TIMEOUT_SECS,
-            )
+            conn = _connect(self._uri)
             metadata = msgpack_numpy.unpackb(conn.recv())
             return conn, metadata
-        except:
-            logging.info("Connection to server with ws:// failed. Trying wss:// ...")
+        except Exception as exc:
+            logging.info("Connection to server with ws:// failed (%s). Trying wss:// ...", exc)
             
         self._uri = "wss://" + self._uri.split("//")[1]
-        conn = websockets.sync.client.connect(
-            self._uri, 
-            compression=None, 
-            max_size=None,
-            ping_interval=PING_INTERVAL_SECS,
-            ping_timeout=PING_TIMEOUT_SECS,
-        )
+        conn = _connect(self._uri)
         metadata = msgpack_numpy.unpackb(conn.recv())
         return conn, metadata
 
